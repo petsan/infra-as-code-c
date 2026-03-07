@@ -89,9 +89,12 @@ def estimate_costs(manifest: Manifest) -> dict[str, dict[str, float]]:
                 cost += len(svc.secrets) * COSTS["secret"]
 
             # Multiply by region count for multi-region deployments
-            env_costs[svc.name] = round(cost * region_count, 2)
+            env_costs[svc.name] = cost * region_count
 
-        env_costs["total"] = round(sum(env_costs.values()), 2)
+        raw_total = sum(env_costs.values())
+        # Round individual costs for display
+        env_costs = {name: round(val, 2) for name, val in env_costs.items()}
+        env_costs["total"] = round(raw_total, 2)
         result[env] = env_costs
 
     return result

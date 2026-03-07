@@ -198,7 +198,10 @@ def detect_state_drift(
         Combined drift report with ``missing_in_state`` and
         ``missing_in_manifest`` lists.
     """
-    env_dir = Path(output_dir) / "terraform" / env
+    # Check for multi-region layout first, fall back to single-region
+    multi_region_dir = Path(output_dir) / "terraform" / region / env
+    single_region_dir = Path(output_dir) / "terraform" / env
+    env_dir = multi_region_dir if multi_region_dir.exists() else single_region_dir
 
     # Read state
     if use_s3:

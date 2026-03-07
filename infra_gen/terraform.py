@@ -187,6 +187,11 @@ def _write_variables(env_dir: Path) -> str:
                 "description": "List of private subnet IDs for ECS services",
                 "type": "list(string)",
             },
+            "db_subnet_group_name": {
+                "description": "Name of the DB subnet group for RDS instances",
+                "type": "string",
+                "default": "",
+            },
         }
     }
     return _write_json(env_dir / "variables.tf.json", content)
@@ -364,6 +369,7 @@ def _build_database(
             "username": "admin",
             "password": f"${{aws_secretsmanager_secret_version.{tf}_db_password.secret_string}}",
             "skip_final_snapshot": env != "prod",
+            "db_subnet_group_name": "${var.db_subnet_group_name}",
             "vpc_security_group_ids": [f"${{aws_security_group.{tf}_db.id}}"],
             "tags": db_tags,
         },
@@ -484,19 +490,21 @@ def _build_secrets(
         {
             "name": f"{svc.name}-{env}-secrets-read",
             "description": f"Allow {svc.name} to read its secrets in {env}",
-            "policy": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "secretsmanager:GetSecretValue",
-                            "secretsmanager:DescribeSecret",
-                        ],
-                        "Resource": secret_arns,
-                    }
-                ],
-            },
+            "policy": json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "secretsmanager:GetSecretValue",
+                                "secretsmanager:DescribeSecret",
+                            ],
+                            "Resource": secret_arns,
+                        }
+                    ],
+                }
+            ),
             "tags": tags,
         },
     )
@@ -543,7 +551,7 @@ def _build_ecs(
         f"{tf}_execution",
         {
             "name": f"{svc.name}-{env}-ecs-execution",
-            "assume_role_policy": assume_ecs,
+            "assume_role_policy": json.dumps(assume_ecs),
             "tags": tags,
         },
     )
@@ -564,7 +572,7 @@ def _build_ecs(
         f"{tf}_task",
         {
             "name": f"{svc.name}-{env}-ecs-task",
-            "assume_role_policy": assume_ecs,
+            "assume_role_policy": json.dumps(assume_ecs),
             "tags": tags,
         },
     )
@@ -638,34 +646,34 @@ def _build_ecs(
             "memory": str(memory),
             "execution_role_arn": f"${{aws_iam_role.{tf}_execution.arn}}",
             "task_role_arn": f"${{aws_iam_role.{tf}_task.arn}}",
-            "container_definitions": [container],
+            "container_definitions": json.dumps([container]),
             "tags": tags,
         },
     )
 
     # ECS Service
-    if ov:
-        _add(
-            resources,
-            "aws_ecs_service",
-            tf,
-            {
-                "name": f"{svc.name}-{env}",
-                "cluster": "${var.ecs_cluster_arn}",
-                "task_definition": f"${{aws_ecs_task_definition.{tf}.arn}}",
-                "desired_count": ov.replicas,
-                "launch_type": "FARGATE",
-                "network_configuration": {
-                    "subnets": "${var.private_subnet_ids}",
-                    "security_groups": [f"${{aws_security_group.{tf}.id}}"],
-                    "assign_public_ip": svc.exposure == "external",
-                },
-                "deployment_circuit_breaker": {"enable": True, "rollback": True},
-                "deployment_minimum_healthy_percent": 100,
-                "deployment_maximum_percent": 200,
-                "tags": tags,
+    replicas = ov.replicas if ov else 1
+    _add(
+        resources,
+        "aws_ecs_service",
+        tf,
+        {
+            "name": f"{svc.name}-{env}",
+            "cluster": "${var.ecs_cluster_arn}",
+            "task_definition": f"${{aws_ecs_task_definition.{tf}.arn}}",
+            "desired_count": replicas,
+            "launch_type": "FARGATE",
+            "network_configuration": {
+                "subnets": "${var.private_subnet_ids}",
+                "security_groups": [f"${{aws_security_group.{tf}.id}}"],
+                "assign_public_ip": svc.exposure == "external",
             },
-        )
+            "deployment_circuit_breaker": {"enable": True, "rollback": True},
+            "deployment_minimum_healthy_percent": 100,
+            "deployment_maximum_percent": 200,
+            "tags": tags,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

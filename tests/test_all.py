@@ -1120,7 +1120,8 @@ class TestECSTaskDefinition:
         """Container definition includes name, image, port, and essential flag."""
         generate_terraform(simple_manifest, tmpdir)
         api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        containers = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"]
+        td = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        containers = json.loads(td["container_definitions"])
         assert len(containers) == 1
         c = containers[0]
         assert c["name"] == "api"
@@ -1132,7 +1133,8 @@ class TestECSTaskDefinition:
         """Container has awslogs log driver pointing to the correct log group."""
         generate_terraform(simple_manifest, tmpdir)
         api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        c = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        td = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        c = json.loads(td["container_definitions"])[0]
         log_config = c["logConfiguration"]
         assert log_config["logDriver"] == "awslogs"
         assert log_config["options"]["awslogs-group"] == "/ecs/api/prod"
@@ -1142,7 +1144,8 @@ class TestECSTaskDefinition:
         """Container has ENV, SERVICE_NAME, and PORT environment variables."""
         generate_terraform(simple_manifest, tmpdir)
         api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        c = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        td = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        c = json.loads(td["container_definitions"])[0]
         env_vars = {e["name"]: e["value"] for e in c["environment"]}
         assert env_vars["ENV"] == "prod"
         assert env_vars["SERVICE_NAME"] == "api"
@@ -1152,7 +1155,8 @@ class TestECSTaskDefinition:
         """Container health check uses HTTP path when health_check_path is set."""
         generate_terraform(simple_manifest, tmpdir)
         api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        c = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        td = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        c = json.loads(td["container_definitions"])[0]
         assert "healthCheck" in c
         assert "/healthz" in c["healthCheck"]["command"][1]
 
@@ -1160,7 +1164,8 @@ class TestECSTaskDefinition:
         """Container has no health check when health_check_path is None."""
         generate_terraform(simple_manifest, tmpdir)
         worker_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "worker.tf.json").read_text())
-        c = worker_tf["resource"]["aws_ecs_task_definition"]["worker"]["container_definitions"][0]
+        td = worker_tf["resource"]["aws_ecs_task_definition"]["worker"]
+        c = json.loads(td["container_definitions"])[0]
         assert "healthCheck" not in c
 
     def test_task_definition_secrets_injected(self, tmpdir):
@@ -1170,7 +1175,7 @@ class TestECSTaskDefinition:
         manifest = Manifest(services=[svc])
         generate_terraform(manifest, tmpdir)
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        c = tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        c = json.loads(tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"])[0]
         assert "secrets" in c
         secret_names = [s["name"] for s in c["secrets"]]
         assert "DB_PASSWORD" in secret_names
@@ -1503,7 +1508,7 @@ class TestSecretsTerraform:
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
         resources = tf["resource"]
         policy = resources["aws_iam_policy"]["web_secrets"]
-        stmt = policy["policy"]["Statement"][0]
+        stmt = json.loads(policy["policy"])["Statement"][0]
         assert "secretsmanager:GetSecretValue" in stmt["Action"]
         assert len(stmt["Resource"]) == 1
 
@@ -1928,3 +1933,271 @@ class TestStateDrift:
             parts = addr.split(".")
             assert len(parts) == 2, f"Address {addr} should be type.name format"
             assert parts[0].startswith("aws_"), f"Type {parts[0]} should start with aws_"
+
+
+# ---- Item 8: DB auto-generated secret tests ----
+
+
+class TestDBAutoSecret:
+    """Tests for auto-generated DB password secrets."""
+
+    def test_db_generates_secret(self, tmpdir):
+        """A service with a database gets an auto-generated DB password secret."""
+        svc = _svc("auth", db="postgres")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
+        resources = tf["resource"]
+        assert "auth_db_password" in resources["aws_secretsmanager_secret"]
+        secret = resources["aws_secretsmanager_secret"]["auth_db_password"]
+        assert "DB_PASSWORD_GENERATED" in secret["name"]
+
+    def test_db_secret_version_has_change_me(self, tmpdir):
+        """Auto-generated DB password secret version has CHANGE_ME placeholder."""
+        svc = _svc("auth", db="postgres")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
+        version = tf["resource"]["aws_secretsmanager_secret_version"]["auth_db_password"]
+        assert version["secret_string"] == "CHANGE_ME"
+
+    def test_db_instance_references_password_secret(self, tmpdir):
+        """RDS instance password references the auto-generated secret."""
+        svc = _svc("auth", db="postgres")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
+        db = tf["resource"]["aws_db_instance"]["auth"]
+        assert "auth_db_password" in db["password"]
+
+
+# ---- Item 9: MySQL and memcached port tests ----
+
+
+class TestMySQLMemcachedPorts:
+    """Tests for MySQL port 3306 and memcached port 11211."""
+
+    def test_mysql_port_3306(self, tmpdir):
+        """MySQL database security group uses port 3306."""
+        svc = _svc("api", db="mysql")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        db_sg = tf["resource"]["aws_security_group"]["api_db"]
+        assert db_sg["ingress"][0]["from_port"] == 3306
+        assert db_sg["ingress"][0]["to_port"] == 3306
+
+    def test_mysql_engine(self, tmpdir):
+        """MySQL database uses mysql engine and version 8.0."""
+        svc = _svc("api", db="mysql")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        db = tf["resource"]["aws_db_instance"]["api"]
+        assert db["engine"] == "mysql"
+        assert db["engine_version"] == "8.0"
+
+    def test_memcached_port_11211(self, tmpdir):
+        """Memcached cache security group uses port 11211."""
+        svc = _svc("api", cache="memcached")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        cache_sg = tf["resource"]["aws_security_group"]["api_cache"]
+        assert cache_sg["ingress"][0]["from_port"] == 11211
+        assert cache_sg["ingress"][0]["to_port"] == 11211
+
+    def test_memcached_engine(self, tmpdir):
+        """Memcached cache uses memcached engine."""
+        svc = _svc("api", cache="memcached")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        cache = tf["resource"]["aws_elasticache_cluster"]["api"]
+        assert cache["engine"] == "memcached"
+
+
+# ---- Item 10: Multiple secrets → single IAM policy ----
+
+
+class TestMultipleSecretsPolicy:
+    """Tests for multiple secrets producing a single IAM policy."""
+
+    def test_multiple_secrets_single_policy(self, tmpdir):
+        """Multiple secrets produce one IAM policy with all ARNs."""
+        svc = _svc("api")
+        svc.secrets = ["DB_PASSWORD", "API_KEY", "JWT_SECRET"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        resources = tf["resource"]
+        # Should have exactly one IAM policy for secrets
+        assert "api_secrets" in resources["aws_iam_policy"]
+        policy_doc = json.loads(resources["aws_iam_policy"]["api_secrets"]["policy"])
+        arns = policy_doc["Statement"][0]["Resource"]
+        assert len(arns) == 3
+
+    def test_each_secret_gets_sm_resource(self, tmpdir):
+        """Each declared secret gets its own SecretsManager secret resource."""
+        svc = _svc("api")
+        svc.secrets = ["DB_PASSWORD", "API_KEY"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        sm = tf["resource"]["aws_secretsmanager_secret"]
+        assert "api_db_password" in sm
+        assert "api_api_key" in sm
+
+
+# ---- Item 11: ECS service always created ----
+
+
+class TestECSServiceAlwaysCreated:
+    """Tests that ECS service is always created even without env_overrides."""
+
+    def test_ecs_service_without_env_overrides(self, tmpdir):
+        """ECS service is created with default replicas when env_overrides is missing."""
+        svc = Service(
+            name="minimal",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={},
+        )
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "minimal.tf.json").read_text())
+        assert "aws_ecs_service" in tf["resource"]
+        ecs = tf["resource"]["aws_ecs_service"]["minimal"]
+        assert ecs["desired_count"] == 1
+
+
+# ---- Item 12: Parser with malformed env_overrides ----
+
+
+class TestParserMalformedEnvOverrides:
+    """Tests for parser handling of malformed env_overrides."""
+
+    def test_parser_missing_replicas_key(self, tmpdir):
+        """Parser raises error when env_overrides entry missing replicas."""
+        manifest_data = {
+            "services": [
+                {
+                    "name": "api",
+                    "port": 8080,
+                    "env_overrides": {
+                        "dev": {"cpu": "250m"},  # missing replicas
+                    },
+                }
+            ]
+        }
+        path = Path(tmpdir) / "bad.yaml"
+        path.write_text(yaml.dump(manifest_data))
+        with pytest.raises(KeyError):
+            parse_manifest(str(path))
+
+    def test_parser_missing_cpu_key(self, tmpdir):
+        """Parser raises error when env_overrides entry missing cpu."""
+        manifest_data = {
+            "services": [
+                {
+                    "name": "api",
+                    "port": 8080,
+                    "env_overrides": {
+                        "dev": {"replicas": 1},  # missing cpu
+                    },
+                }
+            ]
+        }
+        path = Path(tmpdir) / "bad.yaml"
+        path.write_text(yaml.dump(manifest_data))
+        with pytest.raises(KeyError):
+            parse_manifest(str(path))
+
+    def test_parser_env_overrides_not_dict(self, tmpdir):
+        """Parser handles env_overrides that is not a dict."""
+        manifest_data = {
+            "services": [
+                {
+                    "name": "api",
+                    "port": 8080,
+                    "env_overrides": "invalid",
+                }
+            ]
+        }
+        path = Path(tmpdir) / "bad.yaml"
+        path.write_text(yaml.dump(manifest_data))
+        with pytest.raises((TypeError, AttributeError)):
+            parse_manifest(str(path))
+
+
+# ---- Item 15: Service name validation tests ----
+
+
+class TestServiceNameValidation:
+    """Tests for service name format validation."""
+
+    def test_valid_service_name(self):
+        """Valid service names pass validation."""
+        svc = _svc("my-api")
+        manifest = Manifest(services=[svc])
+        errors = validate_manifest(manifest)
+        name_errors = [e for e in errors if "invalid name" in e.message]
+        assert len(name_errors) == 0
+
+    def test_invalid_name_with_dots(self):
+        """Service name with dots fails validation."""
+        svc = _svc("my.api")
+        manifest = Manifest(services=[svc])
+        errors = validate_manifest(manifest)
+        name_errors = [e for e in errors if "invalid name" in e.message]
+        assert len(name_errors) == 1
+
+    def test_invalid_name_with_uppercase(self):
+        """Service name with uppercase fails validation."""
+        svc = _svc("MyApi")
+        manifest = Manifest(services=[svc])
+        errors = validate_manifest(manifest)
+        name_errors = [e for e in errors if "invalid name" in e.message]
+        assert len(name_errors) == 1
+
+    def test_invalid_name_starting_with_number(self):
+        """Service name starting with number fails validation."""
+        svc = _svc("1api")
+        manifest = Manifest(services=[svc])
+        errors = validate_manifest(manifest)
+        name_errors = [e for e in errors if "invalid name" in e.message]
+        assert len(name_errors) == 1
+
+    def test_invalid_name_with_spaces(self):
+        """Service name with spaces fails validation."""
+        svc = _svc("my api")
+        manifest = Manifest(services=[svc])
+        errors = validate_manifest(manifest)
+        name_errors = [e for e in errors if "invalid name" in e.message]
+        assert len(name_errors) == 1
+
+
+# ---- Item 7: DB subnet group name tests ----
+
+
+class TestDBSubnetGroupName:
+    """Tests for db_subnet_group_name variable and RDS reference."""
+
+    def test_variables_include_db_subnet_group(self, simple_manifest, tmpdir):
+        """Variables file includes db_subnet_group_name."""
+        generate_terraform(simple_manifest, tmpdir)
+        path = Path(tmpdir) / "terraform" / "prod" / "variables.tf.json"
+        content = json.loads(path.read_text())
+        assert "db_subnet_group_name" in content["variable"]
+
+    def test_rds_references_db_subnet_group(self, tmpdir):
+        """RDS instance references db_subnet_group_name variable."""
+        svc = _svc("api", db="postgres")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        db = tf["resource"]["aws_db_instance"]["api"]
+        assert db["db_subnet_group_name"] == "${var.db_subnet_group_name}"

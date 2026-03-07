@@ -41,7 +41,7 @@ from .kubernetes import generate_kubernetes
 from .models import Manifest
 from .parser import parse_manifest
 from .state import detect_state_drift
-from .terraform import generate_terraform
+from .terraform import ENVIRONMENTS, generate_terraform
 from .validator import validate_manifest
 
 _EPILOG = textwrap.dedent("""\
@@ -190,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.2",
+        version="%(prog)s 0.1.3",
     )
 
     args = parser.parse_args(argv)
@@ -277,8 +277,6 @@ def _handle_state_drift(manifest: Manifest, output_dir: str, use_s3: bool) -> in
     Returns:
         ``0`` if no drift, ``1`` if drift is detected.
     """
-    from .terraform import ENVIRONMENTS
-
     has_drift = False
     for region in manifest.regions:
         for env in ENVIRONMENTS:

@@ -66,6 +66,7 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
     required_envs = ["dev", "staging", "prod"]
     cpu_regex = re.compile(r"^[0-9]+m$")
     secret_regex = re.compile(r"^[A-Z][A-Z0-9_]*$")
+    name_regex = re.compile(r"^[a-z][a-z0-9-]*$")
     region_regex = re.compile(r"^[a-z]{2}(-[a-z]+-\d+)$")
 
     # Validate regions
@@ -82,6 +83,15 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
         errors.append(ValidationError("Duplicate regions specified"))
 
     for svc in manifest.services:
+        # Service name format
+        if not name_regex.match(svc.name):
+            errors.append(
+                ValidationError(
+                    f"Service '{svc.name}': invalid name "
+                    f"(must match ^[a-z][a-z0-9-]*$ for valid Terraform identifiers)"
+                )
+            )
+
         # Self-references
         if svc.name in svc.dependencies:
             errors.append(
