@@ -58,6 +58,9 @@ def parse_manifest(path: str | Path) -> Manifest:
     with open(path) as f:
         data = yaml.safe_load(f)
 
+    if data is None:
+        data = {}
+
     services = []
     for svc in data.get("services", []):
         env_overrides = {}
@@ -81,4 +84,5 @@ def parse_manifest(path: str | Path) -> Manifest:
             )
         )
 
-    return Manifest(services=services)
+    regions = data.get("regions", ["us-east-1"])
+    return Manifest(services=services, regions=regions)

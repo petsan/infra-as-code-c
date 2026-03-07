@@ -137,8 +137,8 @@ output/
     dev/
       backend.tf.json        # S3 + DynamoDB state backend
       provider.tf.json       # AWS provider with default tags
-      api-gateway.tf.json    # Security groups, ECS, ElastiCache
-      auth-service.tf.json   # Security groups, RDS, ElastiCache, ECS
+      api-gateway.tf.json    # SGs, ECS (task def, IAM, logs), ElastiCache
+      auth-service.tf.json   # SGs, RDS, ElastiCache, ECS (task def, IAM, logs)
     staging/
       ...
     prod/
@@ -242,6 +242,18 @@ Two-service mutual dependencies are valid **peer relationships** and are reporte
 | `db_type != none` | DB security group: inbound only from owning service |
 | `cache != none` | Cache security group: inbound only from owning service |
 | `secrets` non-empty | Secrets Manager secrets + IAM policy scoped to owning service |
+
+### ECS Fargate Stack
+
+Each service generates a complete ECS Fargate deployment:
+
+| Resource | Details |
+|----------|---------|
+| **CloudWatch Log Group** | `/ecs/<service>/<env>`, retention: 30d (prod), 14d (staging), 7d (dev) |
+| **IAM Execution Role** | Pulls images + writes logs (`AmazonECSTaskExecutionRolePolicy`) |
+| **IAM Task Role** | Container runtime permissions; secrets policy attached when applicable |
+| **ECS Task Definition** | Fargate/awsvpc, CPU/memory from `env_overrides`, `awslogs` driver, health check, secrets injection |
+| **ECS Service** | References task def, circuit breaker with rollback, min 100% / max 200% deploy, public IP for `external` only |
 
 ### Tags on Every Resource
 
@@ -417,7 +429,7 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-118 tests covering: parsing, graph algorithms (peers, cycles, topological sort), validation (every error case including secret names), Terraform output (SG directionality, ALB ingress, internal protection, DB isolation, Secrets Manager, IAM policies, tags, peers), Kubernetes output (anti-affinity, topology spread, probes, HPA, NetworkPolicy, Secrets, envFrom), drift detection (forward, reverse, no-drift, structural changes including secrets), cost estimation, and CLI end-to-end.
+165 tests covering: parsing, graph algorithms (peers, cycles, topological sort), validation (every error case including secret names), Terraform output (SG directionality, ALB ingress, internal protection, DB isolation, Secrets Manager, IAM policies, tags, peers), ECS Fargate stack (task definitions, IAM roles, CloudWatch log groups, container definitions, health checks, secrets injection, network config, circuit breaker), Kubernetes output (anti-affinity, topology spread, probes, HPA, NetworkPolicy, Secrets, envFrom), drift detection (forward, reverse, no-drift, structural changes including secrets), cost estimation, and CLI end-to-end.
 
 ## Project Structure
 

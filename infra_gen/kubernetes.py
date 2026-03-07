@@ -51,12 +51,13 @@ ENVIRONMENTS = ["dev", "staging", "prod"]
 
 
 def generate_kubernetes(manifest: Manifest, output_dir: str) -> list[str]:
-    """Generate Kubernetes manifests for all environments.
+    """Generate Kubernetes manifests for all environments and regions.
 
     Args:
         manifest: The validated service manifest.
         output_dir: Root output directory.  Kubernetes files are written to
-            ``<output_dir>/kubernetes/<env>/``.
+            ``<output_dir>/kubernetes/<region>/<env>/`` for multi-region
+            manifests, or ``<output_dir>/kubernetes/<env>/`` for single-region.
 
     Returns:
         List of absolute file paths that were created or overwritten.
@@ -71,19 +72,26 @@ def generate_kubernetes(manifest: Manifest, output_dir: str) -> list[str]:
         peer_labels[b] = label
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    multi_region = len(manifest.regions) > 1
 
-    for env in ENVIRONMENTS:
-        env_dir = Path(output_dir) / "kubernetes" / env
-        env_dir.mkdir(parents=True, exist_ok=True)
+    for region in manifest.regions:
+        for env in ENVIRONMENTS:
+            if multi_region:
+                env_dir = Path(output_dir) / "kubernetes" / region / env
+            else:
+                env_dir = Path(output_dir) / "kubernetes" / env
+            env_dir.mkdir(parents=True, exist_ok=True)
 
-        for svc in manifest.services:
-            docs = _generate_service_manifests(svc, env, svc_map, peer_labels, timestamp)
-            path = env_dir / f"{svc.name}.yaml"
-            content = "---\n".join(
-                yaml.dump(doc, default_flow_style=False, sort_keys=False) for doc in docs
-            )
-            path.write_text(content)
-            generated.append(str(path))
+            for svc in manifest.services:
+                docs = _generate_service_manifests(
+                    svc, env, svc_map, peer_labels, timestamp, region
+                )
+                path = env_dir / f"{svc.name}.yaml"
+                content = "---\n".join(
+                    yaml.dump(doc, default_flow_style=False, sort_keys=False) for doc in docs
+                )
+                path.write_text(content)
+                generated.append(str(path))
 
     return generated
 
@@ -94,6 +102,7 @@ def _generate_service_manifests(
     svc_map: dict[str, Service],
     peer_labels: dict[str, str],
     timestamp: str,
+    region: str = "us-east-1",
 ) -> list[dict[str, Any]]:
     """Build the four Kubernetes resource dicts for a single service.
 
@@ -104,9 +113,10 @@ def _generate_service_manifests(
     replicas = ov.replicas if ov else 1
     cpu = ov.cpu if ov else "250m"
 
-    labels = {
+    labels: dict[str, str] = {
         "app": svc.name,
         "environment": env,
+        "region": region,
         "exposure": svc.exposure,
     }
     if svc.name in peer_labels:
@@ -422,10 +432,10 @@ def _network_policy(
                 }
             )
 
-    # Allow DNS egress
+    # Allow DNS egress (empty selector = allow to any destination)
     egress_rules.append(
         {
-            "to": [],
+            "to": [{}],
             "ports": [
                 {"port": 53, "protocol": "UDP"},
                 {"port": 53, "protocol": "TCP"},

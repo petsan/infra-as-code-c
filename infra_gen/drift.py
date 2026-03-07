@@ -34,6 +34,9 @@ from .models import Manifest
 def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str, str]]]:
     """Compare a manifest against existing generated files and return a drift report.
 
+    Handles both single-region (``terraform/<env>/``) and multi-region
+    (``terraform/<region>/<env>/``) directory layouts automatically.
+
     Args:
         manifest: The current (desired) service manifest.
         output_dir: Root output directory that may contain previously generated
@@ -53,21 +56,45 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
             ``type``, ``environment``, ``file``, ``service``, and ``reason``.
     """
     svc_names = {s.name for s in manifest.services}
+    multi_region = len(manifest.regions) > 1
     report: dict[str, list[dict[str, str]]] = {
         "forward": [],
         "reverse": [],
     }
 
-    # Check Terraform files
-    tf_dir = Path(output_dir) / "terraform"
+    for region in manifest.regions:
+        _detect_terraform_drift(manifest, output_dir, svc_names, multi_region, region, report)
+        _detect_kubernetes_drift(manifest, output_dir, svc_names, multi_region, region, report)
+
+    return report
+
+
+def _detect_terraform_drift(
+    manifest: Manifest,
+    output_dir: str,
+    svc_names: set[str],
+    multi_region: bool,
+    region: str,
+    report: dict[str, list[dict[str, str]]],
+) -> None:
+    """Detect Terraform drift for a single region."""
+    if multi_region:
+        tf_dir = Path(output_dir) / "terraform" / region
+    else:
+        tf_dir = Path(output_dir) / "terraform"
+
+    # Reverse drift: orphaned files
     if tf_dir.exists():
         for env_dir in sorted(tf_dir.iterdir()):
             if not env_dir.is_dir():
                 continue
             env = env_dir.name
             for tf_file in sorted(env_dir.glob("*.tf.json")):
-                # Skip backend and provider files
-                if tf_file.name in ("backend.tf.json", "provider.tf.json"):
+                if tf_file.name in (
+                    "backend.tf.json",
+                    "provider.tf.json",
+                    "variables.tf.json",
+                ):
                     continue
                 svc_name = tf_file.stem.replace(".tf", "")
                 if svc_name not in svc_names:
@@ -81,7 +108,7 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
                         }
                     )
 
-    # Check for services that need new Terraform files (forward)
+    # Forward drift
     for env in ["dev", "staging", "prod"]:
         tf_env_dir = (tf_dir / env) if tf_dir.exists() else None
         for svc_name in sorted(svc_names):
@@ -96,8 +123,7 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
                     }
                 )
             else:
-                # Compare content for structural changes
-                assert tf_env_dir is not None  # guarded by if above
+                assert tf_env_dir is not None
                 existing: dict[str, Any] = json.loads(
                     (tf_env_dir / f"{svc_name}.tf.json").read_text()
                 )
@@ -148,7 +174,12 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
                         }
                     )
 
-                has_secrets_resource = any("secretsmanager" in k for k in existing_resources)
+                # Check for user-secret IAM policy (distinct from DB-generated secrets).
+                # The terraform generator creates aws_iam_policy with a "_secrets" name
+                # only for user-declared secrets, not for auto-generated DB passwords.
+                tf_name = svc_name.replace("-", "_")
+                iam_policies = existing.get("resource", {}).get("aws_iam_policy", {})
+                has_secrets_resource = f"{tf_name}_secrets" in iam_policies
                 if svc.has_secrets and not has_secrets_resource:
                     report["forward"].append(
                         {
@@ -170,8 +201,22 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
                         }
                     )
 
-    # Check Kubernetes files
-    k8s_dir = Path(output_dir) / "kubernetes"
+
+def _detect_kubernetes_drift(
+    manifest: Manifest,
+    output_dir: str,
+    svc_names: set[str],
+    multi_region: bool,
+    region: str,
+    report: dict[str, list[dict[str, str]]],
+) -> None:
+    """Detect Kubernetes drift for a single region."""
+    if multi_region:
+        k8s_dir = Path(output_dir) / "kubernetes" / region
+    else:
+        k8s_dir = Path(output_dir) / "kubernetes"
+
+    # Reverse drift: orphaned files
     if k8s_dir.exists():
         for env_dir in sorted(k8s_dir.iterdir()):
             if not env_dir.is_dir():
@@ -190,6 +235,7 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
                         }
                     )
 
+    # Forward drift
     for env in ["dev", "staging", "prod"]:
         k8s_env_dir = (k8s_dir / env) if k8s_dir.exists() else None
         for svc_name in sorted(svc_names):
@@ -203,8 +249,6 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
                         "reason": "New service, Kubernetes manifest will be created",
                     }
                 )
-
-    return report
 
 
 def format_drift_report(report: dict[str, list[dict[str, str]]]) -> str:

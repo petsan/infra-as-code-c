@@ -127,6 +127,20 @@ class TestParser:
         assert svc_map["api-gateway"].exposure == "external"
         assert svc_map["auth-service"].exposure == "internal"
 
+    def test_parse_empty_yaml(self, tmpdir):
+        """Parser handles empty YAML files without crashing."""
+        empty = Path(tmpdir) / "empty.yaml"
+        empty.write_text("")
+        manifest = parse_manifest(str(empty))
+        assert manifest.services == []
+
+    def test_parse_yaml_with_only_comments(self, tmpdir):
+        """Parser handles YAML with only comments."""
+        path = Path(tmpdir) / "comments.yaml"
+        path.write_text("# just a comment\n")
+        manifest = parse_manifest(str(path))
+        assert manifest.services == []
+
 
 # ---- Graph tests ----
 
@@ -257,21 +271,22 @@ class TestTerraform:
     def test_generates_files(self, simple_manifest, tmpdir):
         files = generate_terraform(simple_manifest, tmpdir)
         assert len(files) > 0
-        # 3 envs * (2 infra files + 3 service files) = 15
-        assert len(files) == 15
+        # 3 envs * (3 infra files + 3 service files) = 18
+        assert len(files) == 18
 
     def test_backend_per_env(self, simple_manifest, tmpdir):
         generate_terraform(simple_manifest, tmpdir)
         for env in ["dev", "staging", "prod"]:
             backend = json.loads((Path(tmpdir) / "terraform" / env / "backend.tf.json").read_text())
             s3 = backend["terraform"]["backend"]["s3"]
-            assert s3["bucket"] == f"terraform-state-{env}"
-            assert s3["dynamodb_table"] == f"terraform-locks-{env}"
+            assert s3["bucket"] == f"terraform-state-{env}-us-east-1"
+            assert s3["dynamodb_table"] == f"terraform-locks-{env}-us-east-1"
+            assert s3["region"] == "us-east-1"
 
     def test_external_gets_alb_ingress(self, simple_manifest, tmpdir):
         generate_terraform(simple_manifest, tmpdir)
         api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        sg = api_tf["resource"]["aws_security_group_api"]
+        sg = api_tf["resource"]["aws_security_group"]["api"]
         has_443 = any(
             r.get("from_port") == 443 and "0.0.0.0/0" in r.get("cidr_blocks", [])
             for r in sg["ingress"]
@@ -281,7 +296,7 @@ class TestTerraform:
     def test_internal_no_public_ingress(self, simple_manifest, tmpdir):
         generate_terraform(simple_manifest, tmpdir)
         auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
-        sg = auth_tf["resource"]["aws_security_group_auth"]
+        sg = auth_tf["resource"]["aws_security_group"]["auth"]
         has_public = any("0.0.0.0/0" in r.get("cidr_blocks", []) for r in sg["ingress"])
         assert not has_public
 
@@ -290,7 +305,7 @@ class TestTerraform:
         generate_terraform(simple_manifest, tmpdir)
         # api depends on auth, so auth gets ingress from api
         auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
-        sg = auth_tf["resource"]["aws_security_group_auth"]
+        sg = auth_tf["resource"]["aws_security_group"]["auth"]
         has_ingress_from_api = any(
             "api" in str(r.get("security_groups", [])) for r in sg["ingress"]
         )
@@ -299,7 +314,7 @@ class TestTerraform:
     def test_db_sg_only_from_service(self, simple_manifest, tmpdir):
         generate_terraform(simple_manifest, tmpdir)
         auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
-        db_sg = auth_tf["resource"]["aws_security_group_auth_db"]
+        db_sg = auth_tf["resource"]["aws_security_group"]["auth_db"]
         # DB SG should only have ingress from the auth service SG
         assert len(db_sg["ingress"]) == 1
         assert "auth" in str(db_sg["ingress"][0]["security_groups"])
@@ -307,7 +322,7 @@ class TestTerraform:
     def test_tags_present(self, simple_manifest, tmpdir):
         generate_terraform(simple_manifest, tmpdir)
         api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        sg = api_tf["resource"]["aws_security_group_api"]
+        sg = api_tf["resource"]["aws_security_group"]["api"]
         tags = sg["tags"]
         assert tags["environment"] == "prod"
         assert tags["service-name"] == "api"
@@ -320,8 +335,8 @@ class TestTerraform:
         order_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "order.tf.json").read_text())
         inv_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "inventory.tf.json").read_text())
 
-        order_sg = order_tf["resource"]["aws_security_group_order"]
-        inv_sg = inv_tf["resource"]["aws_security_group_inventory"]
+        order_sg = order_tf["resource"]["aws_security_group"]["order"]
+        inv_sg = inv_tf["resource"]["aws_security_group"]["inventory"]
 
         # Order should have peer ingress from inventory
         assert any("inventory" in str(r) for r in order_sg["ingress"])
@@ -335,8 +350,26 @@ class TestTerraform:
     def test_peer_group_tag(self, peer_manifest, tmpdir):
         generate_terraform(peer_manifest, tmpdir)
         order_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "order.tf.json").read_text())
-        sg = order_tf["resource"]["aws_security_group_order"]
+        sg = order_tf["resource"]["aws_security_group"]["order"]
         assert sg["tags"]["peer-group"] == "inventory-order"
+
+    def test_variables_file_created(self, simple_manifest, tmpdir):
+        """Each environment gets a variables.tf.json."""
+        generate_terraform(simple_manifest, tmpdir)
+        for env in ["dev", "staging", "prod"]:
+            path = Path(tmpdir) / "terraform" / env / "variables.tf.json"
+            assert path.exists()
+            content = json.loads(path.read_text())
+            assert "vpc_id" in content["variable"]
+            assert "ecs_cluster_arn" in content["variable"]
+            assert "private_subnet_ids" in content["variable"]
+
+    def test_vpc_id_on_security_groups(self, simple_manifest, tmpdir):
+        """All security groups reference var.vpc_id."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        sg = api_tf["resource"]["aws_security_group"]["api"]
+        assert sg["vpc_id"] == "${var.vpc_id}"
 
 
 # ---- Kubernetes tests ----
@@ -566,6 +599,16 @@ class TestCLI:
         """CLI generate returns 1 when manifest has validation errors."""
         rc = main(["sample_with_cycle.yaml", "-o", tmpdir])
         assert rc == 1
+
+    def test_state_without_drift_errors(self, tmpdir):
+        """CLI --state without --drift produces an error."""
+        with pytest.raises(SystemExit):
+            main(["sample.yaml", "--state", "-o", tmpdir])
+
+    def test_state_s3_without_state_errors(self, tmpdir):
+        """CLI --state-s3 without --state produces an error."""
+        with pytest.raises(SystemExit):
+            main(["sample.yaml", "--drift", "--state-s3", "-o", tmpdir])
 
 
 # ---- Graph edge cases ----
@@ -896,6 +939,18 @@ class TestKubernetesEdgeCases:
         protocols = {p["protocol"] for p in dns_rules[0]["ports"]}
         assert protocols == {"UDP", "TCP"}
 
+    def test_network_policy_dns_allows_any_destination(self, simple_manifest, tmpdir):
+        """DNS egress uses empty selector (allow to any) not empty list (block all)."""
+        generate_kubernetes(simple_manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "worker.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        netpol = docs[2]
+        egress = netpol["spec"]["egress"]
+        dns_rules = [r for r in egress if any(p.get("port") == 53 for p in r.get("ports", []))]
+        assert len(dns_rules) == 1
+        # "to" should be [{}] not []
+        assert dns_rules[0]["to"] == [{}]
+
     def test_network_policy_dependency_egress(self, simple_manifest, tmpdir):
         """Service has egress rule to its dependency."""
         generate_kubernetes(simple_manifest, tmpdir)
@@ -960,7 +1015,7 @@ class TestTerraformEdgeCases:
         """Cache SG only allows ingress from the owning service."""
         generate_terraform(simple_manifest, tmpdir)
         auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
-        cache_sg = auth_tf["resource"]["aws_security_group_auth_cache"]
+        cache_sg = auth_tf["resource"]["aws_security_group"]["auth_cache"]
         assert len(cache_sg["ingress"]) == 1
         assert "auth" in str(cache_sg["ingress"][0]["security_groups"])
 
@@ -968,14 +1023,14 @@ class TestTerraformEdgeCases:
         """ECS service desired_count matches env_overrides replicas."""
         generate_terraform(simple_manifest, tmpdir)
         api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
-        ecs = api_tf["resource"]["aws_ecs_service_api"]
+        ecs = api_tf["resource"]["aws_ecs_service"]["api"]
         assert ecs["desired_count"] == 3  # prod_r=3 from _svc default
 
     def test_rds_engine_postgres(self, simple_manifest, tmpdir):
         """RDS instance uses the correct engine."""
         generate_terraform(simple_manifest, tmpdir)
         auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
-        rds = auth_tf["resource"]["aws_db_instance_auth"]
+        rds = auth_tf["resource"]["aws_db_instance"]["auth"]
         assert rds["engine"] == "postgres"
 
     def test_rds_engine_mysql(self, tmpdir):
@@ -983,14 +1038,31 @@ class TestTerraformEdgeCases:
         manifest = Manifest(services=[_svc("db-svc", db="mysql")])
         generate_terraform(manifest, tmpdir)
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "db-svc.tf.json").read_text())
-        rds = tf["resource"]["aws_db_instance_db_svc"]
+        rds = tf["resource"]["aws_db_instance"]["db_svc"]
         assert rds["engine"] == "mysql"
+
+    def test_rds_has_required_fields(self, simple_manifest, tmpdir):
+        """RDS instance has username, password, and skip_final_snapshot."""
+        generate_terraform(simple_manifest, tmpdir)
+        auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
+        rds = auth_tf["resource"]["aws_db_instance"]["auth"]
+        assert "username" in rds
+        assert "password" in rds
+        assert "skip_final_snapshot" in rds
+
+    def test_rds_skip_final_snapshot_by_env(self, simple_manifest, tmpdir):
+        """skip_final_snapshot is False for prod, True for dev/staging."""
+        generate_terraform(simple_manifest, tmpdir)
+        for env, expected in [("prod", False), ("dev", True), ("staging", True)]:
+            tf = json.loads((Path(tmpdir) / "terraform" / env / "auth.tf.json").read_text())
+            rds = tf["resource"]["aws_db_instance"]["auth"]
+            assert rds["skip_final_snapshot"] is expected, f"{env}: skip_final_snapshot wrong"
 
     def test_elasticache_engine(self, simple_manifest, tmpdir):
         """ElastiCache uses the correct engine (redis/memcached)."""
         generate_terraform(simple_manifest, tmpdir)
         auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
-        cache = auth_tf["resource"]["aws_elasticache_cluster_auth"]
+        cache = auth_tf["resource"]["aws_elasticache_cluster"]["auth"]
         assert cache["engine"] == "redis"
 
     def test_provider_default_tags(self, simple_manifest, tmpdir):
@@ -1001,6 +1073,299 @@ class TestTerraformEdgeCases:
         )
         tags = provider["provider"]["aws"]["default_tags"]["tags"]
         assert tags["environment"] == "prod"
+
+    def test_ecs_service_has_cluster(self, simple_manifest, tmpdir):
+        """ECS service references the ECS cluster ARN."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        ecs = api_tf["resource"]["aws_ecs_service"]["api"]
+        assert ecs["cluster"] == "${var.ecs_cluster_arn}"
+
+
+# ---- ECS Task Definition tests ----
+
+
+class TestECSTaskDefinition:
+    def test_task_definition_exists(self, simple_manifest, tmpdir):
+        """Each service gets an ECS task definition."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        assert "api" in api_tf["resource"]["aws_ecs_task_definition"]
+
+    def test_task_definition_fargate(self, simple_manifest, tmpdir):
+        """Task definition uses FARGATE compatibility."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert task_def["requires_compatibilities"] == ["FARGATE"]
+        assert task_def["network_mode"] == "awsvpc"
+
+    def test_task_definition_cpu_is_valid_fargate(self, simple_manifest, tmpdir):
+        """Task definition CPU is a valid Fargate CPU value (rounded up from millicore)."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        # 750m -> rounds up to 1024 Fargate CPU
+        assert task_def["cpu"] == "1024"
+
+    def test_task_definition_memory_matches_fargate_cpu(self, simple_manifest, tmpdir):
+        """Task definition memory matches the Fargate memory for the CPU tier."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        # CPU 1024 -> memory 2048
+        assert task_def["memory"] == "2048"
+
+    def test_task_definition_container_definition(self, simple_manifest, tmpdir):
+        """Container definition includes name, image, port, and essential flag."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        containers = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"]
+        assert len(containers) == 1
+        c = containers[0]
+        assert c["name"] == "api"
+        assert c["image"] == "api:latest"
+        assert c["essential"] is True
+        assert c["portMappings"][0]["containerPort"] == 8080
+
+    def test_task_definition_log_configuration(self, simple_manifest, tmpdir):
+        """Container has awslogs log driver pointing to the correct log group."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        c = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        log_config = c["logConfiguration"]
+        assert log_config["logDriver"] == "awslogs"
+        assert log_config["options"]["awslogs-group"] == "/ecs/api/prod"
+        assert log_config["options"]["awslogs-region"] == "us-east-1"
+
+    def test_task_definition_environment_vars(self, simple_manifest, tmpdir):
+        """Container has ENV, SERVICE_NAME, and PORT environment variables."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        c = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        env_vars = {e["name"]: e["value"] for e in c["environment"]}
+        assert env_vars["ENV"] == "prod"
+        assert env_vars["SERVICE_NAME"] == "api"
+        assert env_vars["PORT"] == "8080"
+
+    def test_task_definition_health_check_with_path(self, simple_manifest, tmpdir):
+        """Container health check uses HTTP path when health_check_path is set."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        c = api_tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        assert "healthCheck" in c
+        assert "/healthz" in c["healthCheck"]["command"][1]
+
+    def test_task_definition_no_health_check_without_path(self, simple_manifest, tmpdir):
+        """Container has no health check when health_check_path is None."""
+        generate_terraform(simple_manifest, tmpdir)
+        worker_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "worker.tf.json").read_text())
+        c = worker_tf["resource"]["aws_ecs_task_definition"]["worker"]["container_definitions"][0]
+        assert "healthCheck" not in c
+
+    def test_task_definition_secrets_injected(self, tmpdir):
+        """Container definition includes secrets from Secrets Manager when declared."""
+        svc = _svc("api")
+        svc.secrets = ["DB_PASSWORD", "API_KEY"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        c = tf["resource"]["aws_ecs_task_definition"]["api"]["container_definitions"][0]
+        assert "secrets" in c
+        secret_names = [s["name"] for s in c["secrets"]]
+        assert "DB_PASSWORD" in secret_names
+        assert "API_KEY" in secret_names
+
+    def test_execution_role_created(self, simple_manifest, tmpdir):
+        """Each service gets an ECS execution role."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        exec_role = api_tf["resource"]["aws_iam_role"]["api_execution"]
+        assert "ecs-tasks.amazonaws.com" in str(exec_role["assume_role_policy"])
+
+    def test_execution_role_policy_attached(self, simple_manifest, tmpdir):
+        """Execution role has the ECS task execution policy attached."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        attachment = api_tf["resource"]["aws_iam_role_policy_attachment"]["api_execution"]
+        assert "AmazonECSTaskExecutionRolePolicy" in attachment["policy_arn"]
+
+    def test_task_role_created(self, simple_manifest, tmpdir):
+        """Each service gets an ECS task role."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_role = api_tf["resource"]["aws_iam_role"]["api_task"]
+        assert "ecs-tasks.amazonaws.com" in str(task_role["assume_role_policy"])
+
+    def test_task_role_secrets_policy_attached(self, tmpdir):
+        """Task role gets secrets policy attached when service has secrets."""
+        svc = _svc("api")
+        svc.secrets = ["DB_PASSWORD"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        assert "api_secrets" in tf["resource"].get("aws_iam_role_policy_attachment", {})
+
+    def test_task_role_no_secrets_policy_without_secrets(self, simple_manifest, tmpdir):
+        """Task role has no secrets policy when service has no secrets."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        assert "api_secrets" not in api_tf["resource"].get("aws_iam_role_policy_attachment", {})
+
+    def test_cloudwatch_log_group_created(self, simple_manifest, tmpdir):
+        """Each service gets a CloudWatch log group."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        log_group = api_tf["resource"]["aws_cloudwatch_log_group"]["api"]
+        assert log_group["name"] == "/ecs/api/prod"
+
+    def test_log_group_retention_by_env(self, simple_manifest, tmpdir):
+        """Log group retention varies by environment: prod=30, staging=14, dev=7."""
+        generate_terraform(simple_manifest, tmpdir)
+        for env, expected_days in [("prod", 30), ("staging", 14), ("dev", 7)]:
+            tf = json.loads((Path(tmpdir) / "terraform" / env / "api.tf.json").read_text())
+            log_group = tf["resource"]["aws_cloudwatch_log_group"]["api"]
+            assert log_group["retention_in_days"] == expected_days, f"{env} retention wrong"
+
+    def test_ecs_service_references_task_definition(self, simple_manifest, tmpdir):
+        """ECS service references the task definition ARN."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        ecs = api_tf["resource"]["aws_ecs_service"]["api"]
+        assert "aws_ecs_task_definition" in ecs["task_definition"]
+
+    def test_ecs_service_launch_type_fargate(self, simple_manifest, tmpdir):
+        """ECS service uses FARGATE launch type."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        ecs = api_tf["resource"]["aws_ecs_service"]["api"]
+        assert ecs["launch_type"] == "FARGATE"
+
+    def test_ecs_service_network_configuration(self, simple_manifest, tmpdir):
+        """ECS service has network configuration with security groups."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        ecs = api_tf["resource"]["aws_ecs_service"]["api"]
+        net = ecs["network_configuration"]
+        assert "security_groups" in net
+        assert "subnets" in net
+
+    def test_ecs_service_external_public_ip(self, simple_manifest, tmpdir):
+        """External services get assign_public_ip=True."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        ecs = api_tf["resource"]["aws_ecs_service"]["api"]
+        assert ecs["network_configuration"]["assign_public_ip"] is True
+
+    def test_ecs_service_internal_no_public_ip(self, simple_manifest, tmpdir):
+        """Internal services get assign_public_ip=False."""
+        generate_terraform(simple_manifest, tmpdir)
+        auth_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "auth.tf.json").read_text())
+        ecs = auth_tf["resource"]["aws_ecs_service"]["auth"]
+        assert ecs["network_configuration"]["assign_public_ip"] is False
+
+    def test_ecs_service_circuit_breaker(self, simple_manifest, tmpdir):
+        """ECS service has deployment circuit breaker with rollback."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        ecs = api_tf["resource"]["aws_ecs_service"]["api"]
+        cb = ecs["deployment_circuit_breaker"]
+        assert cb["enable"] is True
+        assert cb["rollback"] is True
+
+    def test_task_definition_family_includes_env(self, simple_manifest, tmpdir):
+        """Task definition family includes the environment name."""
+        generate_terraform(simple_manifest, tmpdir)
+        for env in ["dev", "staging", "prod"]:
+            tf = json.loads((Path(tmpdir) / "terraform" / env / "api.tf.json").read_text())
+            task_def = tf["resource"]["aws_ecs_task_definition"]["api"]
+            assert task_def["family"] == f"api-{env}"
+
+    def test_execution_role_arn_referenced(self, simple_manifest, tmpdir):
+        """Task definition references the execution role ARN."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert "aws_iam_role" in task_def["execution_role_arn"]
+        assert "execution" in task_def["execution_role_arn"]
+
+    def test_task_role_arn_referenced(self, simple_manifest, tmpdir):
+        """Task definition references the task role ARN."""
+        generate_terraform(simple_manifest, tmpdir)
+        api_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = api_tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert "aws_iam_role" in task_def["task_role_arn"]
+        assert "task" in task_def["task_role_arn"]
+
+
+# ---- Fargate CPU mapping tests ----
+
+
+class TestFargateCPUMapping:
+    def test_250m_maps_to_256(self, tmpdir):
+        """250m rounds up to 256 Fargate CPU."""
+        svc = _svc("api")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "dev" / "api.tf.json").read_text())
+        task_def = tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert task_def["cpu"] == "256"
+        assert task_def["memory"] == "512"
+
+    def test_500m_maps_to_512(self, tmpdir):
+        """500m maps to 512 Fargate CPU."""
+        svc = _svc("api")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "staging" / "api.tf.json").read_text())
+        task_def = tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert task_def["cpu"] == "512"
+        assert task_def["memory"] == "1024"
+
+    def test_750m_maps_to_1024(self, tmpdir):
+        """750m rounds up to 1024 Fargate CPU."""
+        svc = _svc("api")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert task_def["cpu"] == "1024"
+        assert task_def["memory"] == "2048"
+
+    def test_1000m_maps_to_1024(self, tmpdir):
+        """1000m maps to 1024 Fargate CPU (exact match)."""
+        svc = Service(
+            name="api",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={"prod": EnvOverride(replicas=1, cpu="1000m")},
+        )
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert task_def["cpu"] == "1024"
+
+    def test_large_cpu_caps_at_4096(self, tmpdir):
+        """Very large CPU values cap at 4096."""
+        svc = Service(
+            name="api",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={"prod": EnvOverride(replicas=1, cpu="8000m")},
+        )
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        task_def = tf["resource"]["aws_ecs_task_definition"]["api"]
+        assert task_def["cpu"] == "4096"
+        assert task_def["memory"] == "8192"
 
 
 # ---- Secrets / Vault tests ----
@@ -1110,12 +1475,14 @@ class TestSecretsTerraform:
         generate_terraform(manifest, tmpdir)
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
         resources = tf["resource"]
-        # Secret resources
-        assert "aws_secretsmanager_secret_web_db_password" in resources
-        assert "aws_secretsmanager_secret_web_api_key" in resources
+        # Secret resources (nested format: aws_secretsmanager_secret -> {name: config})
+        sm_secrets = resources.get("aws_secretsmanager_secret", {})
+        assert "web_db_password" in sm_secrets
+        assert "web_api_key" in sm_secrets
         # Version resources
-        assert "aws_secretsmanager_secret_web_db_password_version" in resources
-        assert "aws_secretsmanager_secret_web_api_key_version" in resources
+        sm_versions = resources.get("aws_secretsmanager_secret_version", {})
+        assert "web_db_password" in sm_versions
+        assert "web_api_key" in sm_versions
 
     def test_secrets_manager_name_includes_env(self, tmpdir):
         """Secret name follows <service>/<env>/<SECRET_NAME> pattern."""
@@ -1124,7 +1491,7 @@ class TestSecretsTerraform:
         manifest = Manifest(services=[svc])
         generate_terraform(manifest, tmpdir)
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
-        sm = tf["resource"]["aws_secretsmanager_secret_web_db_password"]
+        sm = tf["resource"]["aws_secretsmanager_secret"]["web_db_password"]
         assert sm["name"] == "web/prod/DB_PASSWORD"
 
     def test_secrets_iam_policy_created(self, tmpdir):
@@ -1135,8 +1502,7 @@ class TestSecretsTerraform:
         generate_terraform(manifest, tmpdir)
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
         resources = tf["resource"]
-        policy = resources["aws_iam_policy_web_secrets"]
-        assert policy["type"] == "aws_iam_policy"
+        policy = resources["aws_iam_policy"]["web_secrets"]
         stmt = policy["policy"]["Statement"][0]
         assert "secretsmanager:GetSecretValue" in stmt["Action"]
         assert len(stmt["Resource"]) == 1
@@ -1157,7 +1523,7 @@ class TestSecretsTerraform:
         manifest = Manifest(services=[svc])
         generate_terraform(manifest, tmpdir)
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
-        version = tf["resource"]["aws_secretsmanager_secret_web_token_version"]
+        version = tf["resource"]["aws_secretsmanager_secret_version"]["web_token"]
         assert version["secret_string"] == "CHANGE_ME"
 
 
@@ -1299,3 +1665,266 @@ class TestSecretsCLI:
         docs = list(yaml.safe_load_all(path.read_text()))
         kinds = [d["kind"] for d in docs]
         assert "Secret" in kinds
+
+
+# ---- Multi-region tests ----
+
+
+class TestMultiRegion:
+    def test_single_region_default(self):
+        """Default manifest has single region us-east-1."""
+        manifest = Manifest(services=[_svc("api")])
+        assert manifest.regions == ["us-east-1"]
+
+    def test_single_region_flat_structure(self, tmpdir):
+        """Single region uses flat directory structure (no region subdir)."""
+        manifest = Manifest(services=[_svc("api")])
+        generate_terraform(manifest, tmpdir)
+        # Should be terraform/<env>/ not terraform/<region>/<env>/
+        assert (Path(tmpdir) / "terraform" / "prod" / "api.tf.json").exists()
+        assert not (Path(tmpdir) / "terraform" / "us-east-1").exists()
+
+    def test_multi_region_directory_structure(self, tmpdir):
+        """Multi-region creates region subdirectories."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_terraform(manifest, tmpdir)
+        assert (Path(tmpdir) / "terraform" / "us-east-1" / "prod" / "api.tf.json").exists()
+        assert (Path(tmpdir) / "terraform" / "eu-west-1" / "prod" / "api.tf.json").exists()
+
+    def test_multi_region_file_count(self, tmpdir):
+        """Multi-region doubles the file count for 2 regions."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        tf_files = generate_terraform(manifest, tmpdir)
+        # 2 regions * 3 envs * (3 infra + 1 service) = 24
+        assert len(tf_files) == 24
+
+    def test_multi_region_provider_uses_correct_region(self, tmpdir):
+        """Each region directory has provider configured for that region."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_terraform(manifest, tmpdir)
+        for region in ["us-east-1", "eu-west-1"]:
+            provider = json.loads(
+                (Path(tmpdir) / "terraform" / region / "prod" / "provider.tf.json").read_text()
+            )
+            assert provider["provider"]["aws"]["region"] == region
+
+    def test_multi_region_backend_uses_correct_region(self, tmpdir):
+        """Each region has its own state bucket scoped to that region."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_terraform(manifest, tmpdir)
+        for region in ["us-east-1", "eu-west-1"]:
+            backend = json.loads(
+                (Path(tmpdir) / "terraform" / region / "prod" / "backend.tf.json").read_text()
+            )
+            s3 = backend["terraform"]["backend"]["s3"]
+            assert s3["region"] == region
+            assert region in s3["bucket"]
+
+    def test_multi_region_kubernetes_structure(self, tmpdir):
+        """Multi-region K8s creates region subdirectories."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_kubernetes(manifest, tmpdir)
+        assert (Path(tmpdir) / "kubernetes" / "us-east-1" / "prod" / "api.yaml").exists()
+        assert (Path(tmpdir) / "kubernetes" / "eu-west-1" / "prod" / "api.yaml").exists()
+
+    def test_multi_region_k8s_region_label(self, tmpdir):
+        """K8s manifests include region label."""
+        manifest = Manifest(
+            services=[_svc("api", health="/healthz")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_kubernetes(manifest, tmpdir)
+        for region in ["us-east-1", "eu-west-1"]:
+            path = Path(tmpdir) / "kubernetes" / region / "prod" / "api.yaml"
+            docs = list(yaml.safe_load_all(path.read_text()))
+            labels = docs[0]["metadata"]["labels"]
+            assert labels["region"] == region
+
+    def test_multi_region_cost_multiplier(self):
+        """Costs are multiplied by region count."""
+        single = Manifest(services=[_svc("api")], regions=["us-east-1"])
+        multi = Manifest(services=[_svc("api")], regions=["us-east-1", "eu-west-1"])
+        single_costs = estimate_costs(single)
+        multi_costs = estimate_costs(multi)
+        assert multi_costs["prod"]["api"] == single_costs["prod"]["api"] * 2
+
+    def test_multi_region_drift_detection(self, tmpdir):
+        """Drift detection works with multi-region directory structure."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_terraform(manifest, tmpdir)
+        generate_kubernetes(manifest, tmpdir)
+        report = detect_drift(manifest, tmpdir)
+        assert len(report["forward"]) == 0
+        assert len(report["reverse"]) == 0
+
+
+class TestRegionValidation:
+    def test_valid_regions(self):
+        """Valid AWS region names pass validation."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1", "ap-southeast-2"],
+        )
+        errors = validate_manifest(manifest)
+        region_errors = [e for e in errors if "region" in e.message.lower()]
+        assert len(region_errors) == 0
+
+    def test_invalid_region_format(self):
+        """Invalid region names are flagged."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["not-a-region"],
+        )
+        errors = validate_manifest(manifest)
+        region_errors = [e for e in errors if "region" in e.message.lower()]
+        assert len(region_errors) == 1
+
+    def test_empty_regions_error(self):
+        """Empty regions list is flagged."""
+        manifest = Manifest(services=[_svc("api")], regions=[])
+        errors = validate_manifest(manifest)
+        region_errors = [e for e in errors if "region" in e.message.lower()]
+        assert len(region_errors) == 1
+
+    def test_duplicate_regions_error(self):
+        """Duplicate regions are flagged."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "us-east-1"],
+        )
+        errors = validate_manifest(manifest)
+        region_errors = [e for e in errors if "duplicate" in e.message.lower()]
+        assert len(region_errors) == 1
+
+
+# ---- State-aware drift tests ----
+
+
+class TestStateDrift:
+    def test_no_state_file_all_needs_apply(self, tmpdir):
+        """When no state file exists, all resources are reported as needing apply."""
+        from infra_gen.state import detect_state_drift
+
+        manifest = Manifest(services=[_svc("api")])
+        generate_terraform(manifest, tmpdir)
+        report = detect_state_drift(tmpdir, "prod")
+        assert len(report["missing_in_state"]) > 0
+        assert len(report["missing_in_manifest"]) == 0
+
+    def test_extract_resource_addresses(self):
+        """extract_resource_addresses parses Terraform state format."""
+        from infra_gen.state import extract_resource_addresses
+
+        state = {
+            "resources": [
+                {"type": "aws_ecs_service", "name": "my_svc", "instances": []},
+                {"type": "aws_security_group", "name": "my_sg", "instances": []},
+            ]
+        }
+        addresses = extract_resource_addresses(state)
+        assert "aws_ecs_service.my_svc" in addresses
+        assert "aws_security_group.my_sg" in addresses
+
+    def test_compare_state_finds_missing(self):
+        """compare_state detects resources missing from state (nested format)."""
+        from infra_gen.state import compare_state
+
+        manifest_resources = {
+            "aws_ecs_service": {"api": {"name": "api-prod"}},
+            "aws_security_group": {"api": {"name": "api-sg"}},
+        }
+        state = {
+            "resources": [
+                {"type": "aws_ecs_service", "name": "api", "instances": []},
+            ]
+        }
+        result = compare_state(manifest_resources, state)
+        # SG is in manifest but not in state
+        missing_addrs = [r["address"] for r in result["missing_in_state"]]
+        assert "aws_security_group.api" in missing_addrs
+
+    def test_compare_state_finds_orphaned(self):
+        """compare_state detects resources in state but not in manifest."""
+        from infra_gen.state import compare_state
+
+        manifest_resources = {
+            "aws_ecs_service": {"api": {"name": "api-prod"}},
+        }
+        state = {
+            "resources": [
+                {"type": "aws_ecs_service", "name": "api", "instances": []},
+                {"type": "aws_rds_instance", "name": "old_db", "instances": []},
+            ]
+        }
+        result = compare_state(manifest_resources, state)
+        orphaned_addrs = [r["address"] for r in result["missing_in_manifest"]]
+        assert "aws_rds_instance.old_db" in orphaned_addrs
+
+    def test_read_state_local(self, tmpdir):
+        """read_state reads a local .tfstate file."""
+        from infra_gen.state import read_state
+
+        state_data = {
+            "version": 4,
+            "resources": [{"type": "aws_ecs_service", "name": "test", "instances": []}],
+        }
+        state_path = Path(tmpdir) / "terraform.tfstate"
+        state_path.write_text(json.dumps(state_data))
+        result = read_state(tmpdir)
+        assert len(result["resources"]) == 1
+
+    def test_read_state_missing_file(self, tmpdir):
+        """read_state returns empty dict when no state file exists."""
+        from infra_gen.state import read_state
+
+        result = read_state(tmpdir)
+        assert result == {}
+
+    def test_empty_state_resources(self):
+        """extract_resource_addresses handles empty state."""
+        from infra_gen.state import extract_resource_addresses
+
+        assert extract_resource_addresses({}) == set()
+        assert extract_resource_addresses({"resources": []}) == set()
+
+    def test_s3_param_validation(self):
+        """read_state_from_s3 rejects unsafe bucket/key names."""
+        from infra_gen.state import read_state_from_s3
+
+        with pytest.raises(ValueError, match="Invalid bucket"):
+            read_state_from_s3("bucket; rm -rf /", "key")
+        with pytest.raises(ValueError, match="Invalid key"):
+            read_state_from_s3("bucket", "key$(whoami)")
+        with pytest.raises(ValueError, match="Invalid region"):
+            read_state_from_s3("bucket", "key", region="; echo pwned")
+
+    def test_no_state_addresses_format(self, tmpdir):
+        """Addresses from no-state path use correct type.name format."""
+        from infra_gen.state import detect_state_drift
+
+        manifest = Manifest(services=[_svc("api")])
+        generate_terraform(manifest, tmpdir)
+        report = detect_state_drift(tmpdir, "prod")
+        for item in report["missing_in_state"]:
+            addr = item["address"]
+            parts = addr.split(".")
+            assert len(parts) == 2, f"Address {addr} should be type.name format"
+            assert parts[0].startswith("aws_"), f"Type {parts[0]} should start with aws_"

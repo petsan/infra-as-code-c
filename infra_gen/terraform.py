@@ -2,39 +2,28 @@
 Terraform module generation.
 
 Produces per-environment directories under ``<output>/terraform/<env>/``
-containing JSON-formatted Terraform files (``.tf.json``).
+containing JSON-formatted Terraform files (``.tf.json``) using the official
+`Terraform JSON Configuration Syntax`_.
+
+.. _Terraform JSON Configuration Syntax:
+    https://developer.hashicorp.com/terraform/language/syntax/json
 
 Generated files per environment
 -------------------------------
 ``backend.tf.json``
-    S3 + DynamoDB state backend configuration.  Each environment gets its own
-    bucket (``terraform-state-<env>``) and lock table
-    (``terraform-locks-<env>``).
+    S3 + DynamoDB state backend configuration.
 
 ``provider.tf.json``
-    AWS provider with ``default_tags`` that include the environment name.
+    AWS provider with ``default_tags``.
+
+``variables.tf.json``
+    Input variable declarations (``vpc_id``, ``ecs_cluster_arn``,
+    ``private_subnet_ids``).
 
 ``<service>.tf.json``
-    Per-service resource definitions including:
+    Per-service resource definitions in proper Terraform JSON format::
 
-    * **Security groups** with exact directional rules:
-
-      - *A depends on B* means A can reach B (B gets ingress from A).
-      - External services receive ALB ingress on **443** from ``0.0.0.0/0``.
-      - Internal services **never** get ``0.0.0.0/0`` ingress.
-      - Peer pairs get **bidirectional** ingress + egress rules.
-
-    * **Database security groups** (Postgres 5432 / MySQL 3306) that only
-      allow inbound from the owning service.
-    * **RDS instances** (``db.t3.micro``).
-    * **Cache security groups** (Redis 6379 / Memcached 11211).
-    * **ElastiCache clusters** (``cache.t3.micro``).
-    * **ECS services** with ``desired_count`` from ``env_overrides``.
-
-Tags applied to every resource
-------------------------------
-``environment``, ``service-name``, ``cost-center``, ``dependency-hash``,
-``last-generated`` (ISO-8601 UTC), and ``peer-group`` (for peer services).
+        {"resource": {"aws_type": {"logical_name": {fields...}}}}
 """
 
 from __future__ import annotations
@@ -50,17 +39,53 @@ from .models import Manifest, Service
 ENVIRONMENTS = ["dev", "staging", "prod"]
 """Target deployment environments."""
 
+# Valid ECS Fargate CPU values (in CPU units).
+FARGATE_CPU_VALUES = [256, 512, 1024, 2048, 4096]
+
+# Smallest valid memory (MB) for each Fargate CPU value.
+FARGATE_MEMORY: dict[int, int] = {
+    256: 512,
+    512: 1024,
+    1024: 2048,
+    2048: 4096,
+    4096: 8192,
+}
+
+LOG_RETENTION: dict[str, int] = {"prod": 30, "staging": 14, "dev": 7}
+
+
+def _millicore_to_fargate_cpu(millicore: int) -> int:
+    """Round up a Kubernetes millicore value to the nearest valid Fargate CPU."""
+    for valid in FARGATE_CPU_VALUES:
+        if millicore <= valid:
+            return valid
+    return FARGATE_CPU_VALUES[-1]
+
+
+def _fargate_memory(cpu: int) -> int:
+    """Return the smallest valid Fargate memory (MB) for *cpu* units."""
+    return FARGATE_MEMORY.get(cpu, 512)
+
+
+def _add(
+    resources: dict[str, dict[str, dict[str, Any]]],
+    res_type: str,
+    name: str,
+    config: dict[str, Any],
+) -> None:
+    """Insert a resource into the nested ``{type: {name: config}}`` structure."""
+    resources.setdefault(res_type, {})[name] = config
+
 
 def generate_terraform(manifest: Manifest, output_dir: str) -> list[str]:
-    """Generate Terraform modules for all environments.
+    """Generate Terraform modules for all environments and regions.
 
     Args:
         manifest: The validated service manifest.
-        output_dir: Root output directory.  Terraform files are written to
-            ``<output_dir>/terraform/<env>/``.
+        output_dir: Root output directory.
 
     Returns:
-        List of absolute file paths that were created or overwritten.
+        List of file paths that were created or overwritten.
     """
     generated: list[str] = []
     svc_map = manifest.service_map()
@@ -70,7 +95,6 @@ def generate_terraform(manifest: Manifest, output_dir: str) -> list[str]:
         peer_set.add((a, b))
         peer_set.add((b, a))
 
-    # Build peer group labels
     peer_labels: dict[str, str] = {}
     for a, b in peer_pairs:
         label = "-".join(sorted([a, b]))
@@ -78,78 +102,102 @@ def generate_terraform(manifest: Manifest, output_dir: str) -> list[str]:
         peer_labels[b] = label
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    multi_region = len(manifest.regions) > 1
 
-    for env in ENVIRONMENTS:
-        env_dir = Path(output_dir) / "terraform" / env
-        env_dir.mkdir(parents=True, exist_ok=True)
+    for region in manifest.regions:
+        for env in ENVIRONMENTS:
+            if multi_region:
+                env_dir = Path(output_dir) / "terraform" / region / env
+            else:
+                env_dir = Path(output_dir) / "terraform" / env
+            env_dir.mkdir(parents=True, exist_ok=True)
 
-        # State backend
-        generated.append(_write_backend(env_dir, env))
+            generated.append(_write_backend(env_dir, env, region))
+            generated.append(_write_provider(env_dir, env, region))
+            generated.append(_write_variables(env_dir))
 
-        # Provider
-        generated.append(_write_provider(env_dir, env))
-
-        # Per-service resources
-        for svc in manifest.services:
-            generated.append(
-                _write_service_module(env_dir, env, svc, svc_map, peer_set, peer_labels, timestamp)
-            )
+            for svc in manifest.services:
+                generated.append(
+                    _write_service(
+                        env_dir, env, svc, svc_map, peer_set, peer_labels, timestamp, region
+                    )
+                )
 
     return generated
 
 
-def _write_backend(env_dir: Path, env: str) -> str:
-    """Write the S3 + DynamoDB remote state backend configuration.
+# ---------------------------------------------------------------------------
+# Infrastructure files
+# ---------------------------------------------------------------------------
 
-    Each environment receives a dedicated S3 bucket and DynamoDB lock table
-    to ensure safe concurrent operations and full isolation between
-    environments.
-    """
+
+def _write_backend(env_dir: Path, env: str, region: str = "us-east-1") -> str:
+    """Write the S3 + DynamoDB remote state backend."""
     content = {
         "terraform": {
             "backend": {
                 "s3": {
-                    "bucket": f"terraform-state-{env}",
+                    "bucket": f"terraform-state-{env}-{region}",
                     "key": f"infra/{env}/terraform.tfstate",
-                    "region": "us-east-1",
-                    "dynamodb_table": f"terraform-locks-{env}",
+                    "region": region,
+                    "dynamodb_table": f"terraform-locks-{env}-{region}",
                     "encrypt": True,
                 }
             },
             "required_providers": {
-                "aws": {
-                    "source": "hashicorp/aws",
-                    "version": "~> 5.0",
-                }
+                "aws": {"source": "hashicorp/aws", "version": "~> 5.0"},
             },
         }
     }
-    path = env_dir / "backend.tf.json"
-    path.write_text(json.dumps(content, indent=2) + "\n")
-    return str(path)
+    return _write_json(env_dir / "backend.tf.json", content)
 
 
-def _write_provider(env_dir: Path, env: str) -> str:
-    """Write the AWS provider block with environment-level default tags."""
+def _write_provider(env_dir: Path, env: str, region: str = "us-east-1") -> str:
+    """Write the AWS provider block with default tags."""
     content = {
         "provider": {
             "aws": {
-                "region": "us-east-1",
+                "region": region,
                 "default_tags": {
                     "tags": {
                         "environment": env,
+                        "region": region,
                         "managed-by": "infra-gen",
                     }
                 },
             }
         }
     }
-    path = env_dir / "provider.tf.json"
-    path.write_text(json.dumps(content, indent=2) + "\n")
-    return str(path)
+    return _write_json(env_dir / "provider.tf.json", content)
 
 
-def _write_service_module(
+def _write_variables(env_dir: Path) -> str:
+    """Write input variable declarations needed by service modules."""
+    content = {
+        "variable": {
+            "vpc_id": {
+                "description": "VPC ID for security groups",
+                "type": "string",
+            },
+            "ecs_cluster_arn": {
+                "description": "ARN of the ECS cluster",
+                "type": "string",
+            },
+            "private_subnet_ids": {
+                "description": "List of private subnet IDs for ECS services",
+                "type": "list(string)",
+            },
+        }
+    }
+    return _write_json(env_dir / "variables.tf.json", content)
+
+
+# ---------------------------------------------------------------------------
+# Per-service resource file
+# ---------------------------------------------------------------------------
+
+
+def _write_service(
     env_dir: Path,
     env: str,
     svc: Service,
@@ -157,35 +205,42 @@ def _write_service_module(
     peer_set: set[tuple[str, str]],
     peer_labels: dict[str, str],
     timestamp: str,
+    region: str = "us-east-1",
 ) -> str:
-    """Write all Terraform resources for a single service in one environment.
+    """Write all Terraform resources for one service in one environment."""
+    tf = _tf_name(svc.name)
+    tags = _tags(svc, env, peer_labels, timestamp)
+    resources: dict[str, dict[str, dict[str, Any]]] = {}
 
-    Generates a ``<service>.tf.json`` file containing:
+    _build_security_groups(resources, svc, env, tf, tags, svc_map, peer_set)
+    _build_database(resources, svc, env, tf, tags)
+    _build_cache(resources, svc, env, tf, tags)
+    _build_secrets(resources, svc, env, tf, tags)
+    _build_ecs(resources, svc, env, tf, tags, region)
 
-    * The service security group (with directional / peer / ALB rules).
-    * Database security group + RDS instance (if ``db_type != "none"``).
-    * Cache security group + ElastiCache cluster (if ``cache != "none"``).
-    * An ECS service resource with the correct replica count.
-    """
-    tags = {
-        "environment": env,
-        "service-name": svc.name,
-        "cost-center": f"{env}-{svc.name}",
-        "dependency-hash": svc.dependency_hash(),
-        "last-generated": timestamp,
-    }
-    if svc.name in peer_labels:
-        tags["peer-group"] = peer_labels[svc.name]
+    return _write_json(env_dir / f"{svc.name}.tf.json", {"resource": resources})
 
-    resources: dict[str, Any] = {}
 
-    # VPC security group for the service
-    sg_ingress_rules: list[dict[str, Any]] = []
-    sg_egress_rules: list[dict[str, Any]] = []
+# ---------------------------------------------------------------------------
+# Resource builders
+# ---------------------------------------------------------------------------
 
-    # External services get ALB ingress on 443
+
+def _build_security_groups(
+    resources: dict[str, dict[str, dict[str, Any]]],
+    svc: Service,
+    env: str,
+    tf: str,
+    tags: dict[str, str],
+    svc_map: dict[str, Service],
+    peer_set: set[tuple[str, str]],
+) -> None:
+    """Build the service VPC security group with directional rules."""
+    ingress: list[dict[str, Any]] = []
+    egress: list[dict[str, Any]] = []
+
     if svc.exposure == "external":
-        sg_ingress_rules.append(
+        ingress.append(
             {
                 "description": "ALB ingress HTTPS",
                 "from_port": 443,
@@ -195,31 +250,24 @@ def _write_service_module(
             }
         )
 
-    # Dependency-based rules: if A depends on B, A can reach B
-    # So B gets ingress FROM A on B's port
+    # Dependency-based: if other_svc depends on us, it can reach us
     for other_svc in svc_map.values():
-        if svc.name in other_svc.dependencies:
-            # other_svc depends on us, so other_svc can reach us
-            is_peer = (svc.name, other_svc.name) in peer_set
-            if not is_peer:
-                sg_ingress_rules.append(
-                    {
-                        "description": f"Ingress from {other_svc.name}",
-                        "from_port": svc.port,
-                        "to_port": svc.port,
-                        "protocol": "tcp",
-                        "security_groups": [
-                            f"${{aws_security_group.{_tf_name(other_svc.name)}.id}}"
-                        ],
-                    }
-                )
+        if svc.name in other_svc.dependencies and (svc.name, other_svc.name) not in peer_set:
+            ingress.append(
+                {
+                    "description": f"Ingress from {other_svc.name}",
+                    "from_port": svc.port,
+                    "to_port": svc.port,
+                    "protocol": "tcp",
+                    "security_groups": [f"${{aws_security_group.{_tf_name(other_svc.name)}.id}}"],
+                }
+            )
 
-    # Peer relationship: bidirectional rules
+    # Peer bidirectional rules
     for other_name in sorted(svc_map.keys()):
         if (svc.name, other_name) in peer_set:
-            other_svc = svc_map[other_name]
-            # We can reach peer and peer can reach us
-            sg_ingress_rules.append(
+            other = svc_map[other_name]
+            ingress.append(
                 {
                     "description": f"Peer ingress from {other_name}",
                     "from_port": svc.port,
@@ -228,135 +276,212 @@ def _write_service_module(
                     "security_groups": [f"${{aws_security_group.{_tf_name(other_name)}.id}}"],
                 }
             )
-            sg_egress_rules.append(
+            egress.append(
                 {
                     "description": f"Peer egress to {other_name}",
-                    "from_port": other_svc.port,
-                    "to_port": other_svc.port,
+                    "from_port": other.port,
+                    "to_port": other.port,
                     "protocol": "tcp",
                     "security_groups": [f"${{aws_security_group.{_tf_name(other_name)}.id}}"],
                 }
             )
 
-    # Egress to dependencies (non-peer)
+    # Egress to non-peer dependencies
     for dep_name in svc.dependencies:
         if dep_name in svc_map and (svc.name, dep_name) not in peer_set:
-            dep_svc = svc_map[dep_name]
-            sg_egress_rules.append(
+            dep = svc_map[dep_name]
+            egress.append(
                 {
                     "description": f"Egress to dependency {dep_name}",
-                    "from_port": dep_svc.port,
-                    "to_port": dep_svc.port,
+                    "from_port": dep.port,
+                    "to_port": dep.port,
                     "protocol": "tcp",
                     "security_groups": [f"${{aws_security_group.{_tf_name(dep_name)}.id}}"],
                 }
             )
 
-    # IMPORTANT: Internal services must NOT have 0.0.0.0/0 ingress
-    # even if external services depend on them. The ALB ingress is only
-    # added for external services above.
+    _add(
+        resources,
+        "aws_security_group",
+        tf,
+        {
+            "name": f"{svc.name}-{env}-sg",
+            "description": f"Security group for {svc.name} in {env}",
+            "vpc_id": "${var.vpc_id}",
+            "tags": tags,
+            "ingress": ingress,
+            "egress": egress,
+        },
+    )
 
-    resources[f"aws_security_group_{_tf_name(svc.name)}"] = {
-        "type": "aws_security_group",
-        "name": f"{svc.name}-{env}-sg",
-        "description": f"Security group for {svc.name} in {env}",
-        "tags": tags,
-        "ingress": sg_ingress_rules,
-        "egress": sg_egress_rules,
-    }
 
-    # Database security group (if service has db)
-    if svc.has_db:
-        db_port = 5432 if svc.db_type == "postgres" else 3306
-        db_ingress = [
-            {
-                "description": f"DB ingress from {svc.name}",
-                "from_port": db_port,
-                "to_port": db_port,
-                "protocol": "tcp",
-                "security_groups": [f"${{aws_security_group.{_tf_name(svc.name)}.id}}"],
-            }
-        ]
+def _build_database(
+    resources: dict[str, dict[str, dict[str, Any]]],
+    svc: Service,
+    env: str,
+    tf: str,
+    tags: dict[str, str],
+) -> None:
+    """Build DB security group + RDS instance."""
+    if not svc.has_db:
+        return
 
-        db_tags = dict(tags)
-        db_tags["service-name"] = f"{svc.name}-db"
+    db_port = 5432 if svc.db_type == "postgres" else 3306
+    db_tags = {**tags, "service-name": f"{svc.name}-db"}
 
-        resources[f"aws_security_group_{_tf_name(svc.name)}_db"] = {
-            "type": "aws_security_group",
+    _add(
+        resources,
+        "aws_security_group",
+        f"{tf}_db",
+        {
             "name": f"{svc.name}-{env}-db-sg",
             "description": f"Database security group for {svc.name} in {env}",
+            "vpc_id": "${var.vpc_id}",
             "tags": db_tags,
-            "ingress": db_ingress,
+            "ingress": [
+                {
+                    "description": f"DB ingress from {svc.name}",
+                    "from_port": db_port,
+                    "to_port": db_port,
+                    "protocol": "tcp",
+                    "security_groups": [f"${{aws_security_group.{tf}.id}}"],
+                }
+            ],
             "egress": [],
-        }
+        },
+    )
 
-        # RDS instance
-        resources[f"aws_db_instance_{_tf_name(svc.name)}"] = {
-            "type": "aws_db_instance",
+    _add(
+        resources,
+        "aws_db_instance",
+        tf,
+        {
             "identifier": f"{svc.name}-{env}",
             "engine": "postgres" if svc.db_type == "postgres" else "mysql",
+            "engine_version": "15.4" if svc.db_type == "postgres" else "8.0",
             "instance_class": "db.t3.micro",
             "allocated_storage": 20,
-            "vpc_security_group_ids": [f"${{aws_security_group.{_tf_name(svc.name)}_db.id}}"],
+            "username": "admin",
+            "password": f"${{aws_secretsmanager_secret_version.{tf}_db_password.secret_string}}",
+            "skip_final_snapshot": env != "prod",
+            "vpc_security_group_ids": [f"${{aws_security_group.{tf}_db.id}}"],
             "tags": db_tags,
-        }
+        },
+    )
 
-    # Cache (ElastiCache)
-    if svc.has_cache:
-        cache_port = 6379 if svc.cache == "redis" else 11211
-        cache_ingress = [
-            {
-                "description": f"Cache ingress from {svc.name}",
-                "from_port": cache_port,
-                "to_port": cache_port,
-                "protocol": "tcp",
-                "security_groups": [f"${{aws_security_group.{_tf_name(svc.name)}.id}}"],
-            }
-        ]
+    # Auto-generate a Secrets Manager secret for the DB password
+    _add(
+        resources,
+        "aws_secretsmanager_secret",
+        f"{tf}_db_password",
+        {
+            "name": f"{svc.name}/{env}/DB_PASSWORD_GENERATED",
+            "description": f"Auto-generated DB password for {svc.name} in {env}",
+            "tags": db_tags,
+        },
+    )
+    _add(
+        resources,
+        "aws_secretsmanager_secret_version",
+        f"{tf}_db_password",
+        {
+            "secret_id": f"${{aws_secretsmanager_secret.{tf}_db_password.id}}",
+            "secret_string": "CHANGE_ME",
+        },
+    )
 
-        cache_tags = dict(tags)
-        cache_tags["service-name"] = f"{svc.name}-cache"
 
-        resources[f"aws_security_group_{_tf_name(svc.name)}_cache"] = {
-            "type": "aws_security_group",
+def _build_cache(
+    resources: dict[str, dict[str, dict[str, Any]]],
+    svc: Service,
+    env: str,
+    tf: str,
+    tags: dict[str, str],
+) -> None:
+    """Build cache security group + ElastiCache cluster."""
+    if not svc.has_cache:
+        return
+
+    cache_port = 6379 if svc.cache == "redis" else 11211
+    cache_tags = {**tags, "service-name": f"{svc.name}-cache"}
+
+    _add(
+        resources,
+        "aws_security_group",
+        f"{tf}_cache",
+        {
             "name": f"{svc.name}-{env}-cache-sg",
             "description": f"Cache security group for {svc.name} in {env}",
+            "vpc_id": "${var.vpc_id}",
             "tags": cache_tags,
-            "ingress": cache_ingress,
+            "ingress": [
+                {
+                    "description": f"Cache ingress from {svc.name}",
+                    "from_port": cache_port,
+                    "to_port": cache_port,
+                    "protocol": "tcp",
+                    "security_groups": [f"${{aws_security_group.{tf}.id}}"],
+                }
+            ],
             "egress": [],
-        }
+        },
+    )
 
-        resources[f"aws_elasticache_cluster_{_tf_name(svc.name)}"] = {
-            "type": "aws_elasticache_cluster",
+    _add(
+        resources,
+        "aws_elasticache_cluster",
+        tf,
+        {
             "cluster_id": f"{svc.name}-{env}",
             "engine": svc.cache,
             "node_type": "cache.t3.micro",
             "num_cache_nodes": 1,
-            "security_group_ids": [f"${{aws_security_group.{_tf_name(svc.name)}_cache.id}}"],
+            "security_group_ids": [f"${{aws_security_group.{tf}_cache.id}}"],
             "tags": cache_tags,
-        }
+        },
+    )
 
-    # Secrets Manager
-    if svc.has_secrets:
-        secret_arns: list[str] = []
-        for secret_name in svc.secrets:
-            sm_key = f"aws_secretsmanager_secret_{_tf_name(svc.name)}_{secret_name.lower()}"
-            full_name = f"{svc.name}/{env}/{secret_name}"
-            resources[sm_key] = {
-                "type": "aws_secretsmanager_secret",
-                "name": full_name,
+
+def _build_secrets(
+    resources: dict[str, dict[str, dict[str, Any]]],
+    svc: Service,
+    env: str,
+    tf: str,
+    tags: dict[str, str],
+) -> None:
+    """Build Secrets Manager secrets + IAM policy."""
+    if not svc.has_secrets:
+        return
+
+    secret_arns: list[str] = []
+    for secret_name in svc.secrets:
+        sm_name = f"{tf}_{secret_name.lower()}"
+        _add(
+            resources,
+            "aws_secretsmanager_secret",
+            sm_name,
+            {
+                "name": f"{svc.name}/{env}/{secret_name}",
                 "description": f"Secret {secret_name} for {svc.name} in {env}",
                 "tags": tags,
-            }
-            resources[f"{sm_key}_version"] = {
-                "type": "aws_secretsmanager_secret_version",
-                "secret_id": f"${{aws_secretsmanager_secret.{sm_key}.id}}",
+            },
+        )
+        _add(
+            resources,
+            "aws_secretsmanager_secret_version",
+            sm_name,
+            {
+                "secret_id": f"${{aws_secretsmanager_secret.{sm_name}.id}}",
                 "secret_string": "CHANGE_ME",
-            }
-            secret_arns.append(f"${{aws_secretsmanager_secret.{sm_key}.arn}}")
+            },
+        )
+        secret_arns.append(f"${{aws_secretsmanager_secret.{sm_name}.arn}}")
 
-        resources[f"aws_iam_policy_{_tf_name(svc.name)}_secrets"] = {
-            "type": "aws_iam_policy",
+    _add(
+        resources,
+        "aws_iam_policy",
+        f"{tf}_secrets",
+        {
             "name": f"{svc.name}-{env}-secrets-read",
             "description": f"Allow {svc.name} to read its secrets in {env}",
             "policy": {
@@ -373,28 +498,201 @@ def _write_service_module(
                 ],
             },
             "tags": tags,
-        }
+        },
+    )
 
-    # ECS / compute
-    ov = svc.env_overrides.get(env)
-    if ov:
-        resources[f"aws_ecs_service_{_tf_name(svc.name)}"] = {
-            "type": "aws_ecs_service",
-            "name": f"{svc.name}-{env}",
-            "desired_count": ov.replicas,
+
+def _build_ecs(
+    resources: dict[str, dict[str, dict[str, Any]]],
+    svc: Service,
+    env: str,
+    tf: str,
+    tags: dict[str, str],
+    region: str,
+) -> None:
+    """Build CloudWatch log group, IAM roles, ECS task definition + service."""
+    log_group_name = f"/ecs/{svc.name}/{env}"
+
+    # CloudWatch Log Group
+    _add(
+        resources,
+        "aws_cloudwatch_log_group",
+        tf,
+        {
+            "name": log_group_name,
+            "retention_in_days": LOG_RETENTION.get(env, 7),
             "tags": tags,
+        },
+    )
+
+    # IAM Execution Role
+    assume_ecs = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+    _add(
+        resources,
+        "aws_iam_role",
+        f"{tf}_execution",
+        {
+            "name": f"{svc.name}-{env}-ecs-execution",
+            "assume_role_policy": assume_ecs,
+            "tags": tags,
+        },
+    )
+    _add(
+        resources,
+        "aws_iam_role_policy_attachment",
+        f"{tf}_execution",
+        {
+            "role": f"${{aws_iam_role.{tf}_execution.name}}",
+            "policy_arn": "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
+        },
+    )
+
+    # IAM Task Role
+    _add(
+        resources,
+        "aws_iam_role",
+        f"{tf}_task",
+        {
+            "name": f"{svc.name}-{env}-ecs-task",
+            "assume_role_policy": assume_ecs,
+            "tags": tags,
+        },
+    )
+    if svc.has_secrets:
+        _add(
+            resources,
+            "aws_iam_role_policy_attachment",
+            f"{tf}_secrets",
+            {
+                "role": f"${{aws_iam_role.{tf}_task.name}}",
+                "policy_arn": f"${{aws_iam_policy.{tf}_secrets.arn}}",
+            },
+        )
+
+    # ECS Task Definition
+    ov = svc.env_overrides.get(env)
+    millicore = int((ov.cpu if ov else "256m").rstrip("m"))
+    cpu = _millicore_to_fargate_cpu(millicore)
+    memory = _fargate_memory(cpu)
+
+    container: dict[str, Any] = {
+        "name": svc.name,
+        "image": f"{svc.name}:latest",
+        "essential": True,
+        "portMappings": [{"containerPort": svc.port, "protocol": "tcp"}],
+        "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": log_group_name,
+                "awslogs-region": region,
+                "awslogs-stream-prefix": svc.name,
+            },
+        },
+        "environment": [
+            {"name": "ENV", "value": env},
+            {"name": "SERVICE_NAME", "value": svc.name},
+            {"name": "PORT", "value": str(svc.port)},
+        ],
+    }
+
+    if svc.health_check_path:
+        container["healthCheck"] = {
+            "command": [
+                "CMD-SHELL",
+                f"curl -f http://localhost:{svc.port}{svc.health_check_path} || exit 1",
+            ],
+            "interval": 30,
+            "timeout": 5,
+            "retries": 3,
+            "startPeriod": 60,
         }
 
-    content = {"resource": resources}
-    path = env_dir / f"{svc.name}.tf.json"
+    if svc.has_secrets:
+        container["secrets"] = [
+            {
+                "name": s,
+                "valueFrom": f"${{aws_secretsmanager_secret.{tf}_{s.lower()}.arn}}",
+            }
+            for s in svc.secrets
+        ]
+
+    _add(
+        resources,
+        "aws_ecs_task_definition",
+        tf,
+        {
+            "family": f"{svc.name}-{env}",
+            "requires_compatibilities": ["FARGATE"],
+            "network_mode": "awsvpc",
+            "cpu": str(cpu),
+            "memory": str(memory),
+            "execution_role_arn": f"${{aws_iam_role.{tf}_execution.arn}}",
+            "task_role_arn": f"${{aws_iam_role.{tf}_task.arn}}",
+            "container_definitions": [container],
+            "tags": tags,
+        },
+    )
+
+    # ECS Service
+    if ov:
+        _add(
+            resources,
+            "aws_ecs_service",
+            tf,
+            {
+                "name": f"{svc.name}-{env}",
+                "cluster": "${var.ecs_cluster_arn}",
+                "task_definition": f"${{aws_ecs_task_definition.{tf}.arn}}",
+                "desired_count": ov.replicas,
+                "launch_type": "FARGATE",
+                "network_configuration": {
+                    "subnets": "${var.private_subnet_ids}",
+                    "security_groups": [f"${{aws_security_group.{tf}.id}}"],
+                    "assign_public_ip": svc.exposure == "external",
+                },
+                "deployment_circuit_breaker": {"enable": True, "rollback": True},
+                "deployment_minimum_healthy_percent": 100,
+                "deployment_maximum_percent": 200,
+                "tags": tags,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _tags(svc: Service, env: str, peer_labels: dict[str, str], timestamp: str) -> dict[str, str]:
+    """Build the standard tag set for a service."""
+    t = {
+        "environment": env,
+        "service-name": svc.name,
+        "cost-center": f"{env}-{svc.name}",
+        "dependency-hash": svc.dependency_hash(),
+        "last-generated": timestamp,
+    }
+    if svc.name in peer_labels:
+        t["peer-group"] = peer_labels[svc.name]
+    return t
+
+
+def _write_json(path: Path, content: dict[str, Any]) -> str:
+    """Write *content* as indented JSON to *path* and return the path string."""
     path.write_text(json.dumps(content, indent=2) + "\n")
     return str(path)
 
 
 def _tf_name(name: str) -> str:
-    """Convert a kebab-case service name to a Terraform-safe identifier.
-
-    Terraform resource names cannot contain hyphens, so ``my-service``
-    becomes ``my_service``.
-    """
+    """Convert a kebab-case service name to a Terraform-safe identifier."""
     return name.replace("-", "_")

@@ -40,6 +40,7 @@ from .graph import find_peer_pairs, topological_sort
 from .kubernetes import generate_kubernetes
 from .models import Manifest
 from .parser import parse_manifest
+from .state import detect_state_drift
 from .terraform import generate_terraform
 from .validator import validate_manifest
 
@@ -170,16 +171,42 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--state",
+        action="store_true",
+        help=(
+            "Use with --drift to compare against actual Terraform state "
+            "instead of just generated files.  Reads local .tfstate files "
+            "or fetches from S3 with --state-s3."
+        ),
+    )
+    parser.add_argument(
+        "--state-s3",
+        action="store_true",
+        help=(
+            "Use with --state to fetch Terraform state from S3 backends "
+            "instead of local .tfstate files.  Requires AWS CLI."
+        ),
+    )
+    parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.1",
+        version="%(prog)s 0.1.2",
     )
 
     args = parser.parse_args(argv)
 
+    # Validate flag combinations
+    if args.state and not args.drift:
+        parser.error("--state requires --drift")
+    if args.state_s3 and not args.state:
+        parser.error("--state-s3 requires --state")
+
     # Parse manifest
     try:
         manifest = parse_manifest(args.manifest)
+    except (FileNotFoundError, PermissionError) as e:
+        print(f"Error parsing manifest: {e}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"Error parsing manifest: {e}", file=sys.stderr)
         return 1
@@ -194,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # --drift
     if args.drift:
+        if args.state:
+            return _handle_state_drift(manifest, args.output, args.state_s3)
         return _handle_drift(manifest, args.output)
 
     # --dry-run
@@ -240,6 +269,39 @@ def _handle_drift(manifest: Manifest, output_dir: str) -> int:
         print(f"\nWARNING: {len(report['reverse'])} orphaned resource(s) detected!")
         return 1
     return 0
+
+
+def _handle_state_drift(manifest: Manifest, output_dir: str, use_s3: bool) -> int:
+    """Run state-aware drift detection against actual Terraform state.
+
+    Returns:
+        ``0`` if no drift, ``1`` if drift is detected.
+    """
+    from .terraform import ENVIRONMENTS
+
+    has_drift = False
+    for region in manifest.regions:
+        for env in ENVIRONMENTS:
+            print(f"=== State Drift: {env} ({region}) ===")
+            report = detect_state_drift(output_dir, env, region, use_s3=use_s3)
+
+            if report["missing_in_state"]:
+                has_drift = True
+                print("  Resources not yet applied:")
+                for item in report["missing_in_state"]:
+                    print(f"    [NEEDS APPLY] {item['address']}")
+
+            if report["missing_in_manifest"]:
+                has_drift = True
+                print("  Orphaned resources in state:")
+                for item in report["missing_in_manifest"]:
+                    print(f"    [ORPHANED] {item['address']}")
+
+            if not report["missing_in_state"] and not report["missing_in_manifest"]:
+                print("  No drift detected.")
+            print()
+
+    return 1 if has_drift else 0
 
 
 def _handle_dry_run(manifest: Manifest) -> int:

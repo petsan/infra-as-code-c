@@ -103,9 +103,13 @@ class Manifest:
     Attributes:
         services: Ordered list of :class:`Service` instances parsed from the
             YAML ``services`` key.
+        regions: List of AWS regions to deploy to.  Defaults to
+            ``["us-east-1"]``.  Each region gets its own directory subtree
+            with separate state backends and provider configurations.
     """
 
     services: list[Service]
+    regions: list[str] = field(default_factory=lambda: ["us-east-1"])
 
     def service_map(self) -> dict[str, Service]:
         """Build a name-keyed lookup dictionary for fast service resolution.

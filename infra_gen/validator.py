@@ -66,6 +66,20 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
     required_envs = ["dev", "staging", "prod"]
     cpu_regex = re.compile(r"^[0-9]+m$")
     secret_regex = re.compile(r"^[A-Z][A-Z0-9_]*$")
+    region_regex = re.compile(r"^[a-z]{2}(-[a-z]+-\d+)$")
+
+    # Validate regions
+    if not manifest.regions:
+        errors.append(ValidationError("At least one region must be specified"))
+    for region in manifest.regions:
+        if not region_regex.match(region):
+            errors.append(
+                ValidationError(
+                    f"Invalid region '{region}' (must match AWS region format, e.g. 'us-east-1')"
+                )
+            )
+    if len(manifest.regions) != len(set(manifest.regions)):
+        errors.append(ValidationError("Duplicate regions specified"))
 
     for svc in manifest.services:
         # Self-references

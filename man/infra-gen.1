@@ -180,8 +180,9 @@ S3 + DynamoDB state backend per environment.
 AWS provider configuration with default tags.
 .TP
 .I <output>/terraform/<env>/<service>.tf.json
-Per-service Terraform resources (security groups, RDS, ElastiCache, ECS,
-Secrets Manager).
+Per-service Terraform resources: security groups, RDS, ElastiCache,
+ECS Fargate stack (task definition, IAM execution/task roles, CloudWatch
+log group, ECS service with circuit breaker), and Secrets Manager.
 .TP
 .I <output>/kubernetes/<env>/<service>.yaml
 Multi-document YAML containing Deployment, Service, NetworkPolicy, HPA, and

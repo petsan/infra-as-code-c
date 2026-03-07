@@ -24,15 +24,20 @@ validator
     replica ordering, and cycle errors.
 terraform
     Terraform JSON module writer -- backends, providers, security groups,
-    RDS instances, ElastiCache clusters, and ECS services.
+    RDS instances, ElastiCache clusters, ECS Fargate stack (task definitions,
+    IAM roles, CloudWatch log groups), and Secrets Manager.
 kubernetes
     Kubernetes YAML writer -- Deployments (anti-affinity + topology spread),
-    Services, NetworkPolicies, and HorizontalPodAutoscalers.
+    Services, NetworkPolicies, HorizontalPodAutoscalers, and Secrets.
 drift
     Bidirectional drift detector -- forward (pending changes) and reverse
-    (orphaned resources).
+    (orphaned resources).  Supports multi-region directory layouts.
+state
+    Terraform state reader for state-aware drift detection.  Reads local
+    ``.tfstate`` files or fetches from S3 backends.
 cost
     AWS monthly cost estimator using fixed per-instance-type pricing.
+    Scales costs by region count for multi-region deployments.
 
 Quick start
 -----------
@@ -42,4 +47,4 @@ Quick start
 >>> generate_terraform(manifest, "output")
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

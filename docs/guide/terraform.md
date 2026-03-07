@@ -130,9 +130,31 @@ Plus one IAM policy per service:
 
 See [Secrets Vault](secrets.md) for the full setup workflow.
 
-### ECS Service
+### ECS Resources
 
-An ECS service with `desired_count` from the environment's `replicas` override.
+Each service generates a full ECS Fargate stack:
+
+- **CloudWatch Log Group**: `/ecs/<service>/<env>` with environment-based
+  retention (prod: 30 days, staging: 14 days, dev: 7 days).
+- **IAM Execution Role**: allows the ECS agent to pull container images and
+  write to CloudWatch Logs.  The managed policy
+  `AmazonECSTaskExecutionRolePolicy` is attached.
+- **IAM Task Role**: runtime permissions for the container itself.  When
+  the service declares `secrets`, the secrets read policy is attached to
+  this role.
+- **ECS Task Definition** (Fargate, `awsvpc` network mode):
+    - CPU and memory derived from `env_overrides.cpu` (millicore value maps
+      directly to ECS CPU units; memory = max(512, cpu × 2) MB).
+    - Container definition with image, port mappings, `awslogs` log driver,
+      and environment variables (`ENV`, `SERVICE_NAME`, `PORT`).
+    - Health check using `health_check_path` (when set) via `curl`.
+    - Secrets injected from Secrets Manager `valueFrom` ARNs (when declared).
+- **ECS Service**:
+    - References the task definition and uses `FARGATE` launch type.
+    - Network configuration with private subnets, the service security group,
+      and `assign_public_ip` set to `true` only for `external` services.
+    - Deployment circuit breaker with automatic rollback enabled.
+    - Rolling deploy: min healthy 100%, max 200%.
 
 ## Tags
 

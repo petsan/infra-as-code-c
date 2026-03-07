@@ -42,7 +42,11 @@ ENVIRONMENTS = ["dev", "staging", "prod"]
 
 
 def estimate_costs(manifest: Manifest) -> dict[str, dict[str, float]]:
-    """Estimate monthly AWS costs per environment.
+    """Estimate monthly AWS costs per environment across all regions.
+
+    When multiple regions are configured, costs for each service are
+    multiplied by the number of regions since resources are deployed to
+    every region.
 
     Args:
         manifest: The parsed service manifest.
@@ -59,6 +63,7 @@ def estimate_costs(manifest: Manifest) -> dict[str, dict[str, float]]:
             }
     """
     result: dict[str, dict[str, float]] = {}
+    region_count = len(manifest.regions)
 
     for env in ENVIRONMENTS:
         env_costs: dict[str, float] = {}
@@ -83,7 +88,8 @@ def estimate_costs(manifest: Manifest) -> dict[str, dict[str, float]]:
             if svc.has_secrets:
                 cost += len(svc.secrets) * COSTS["secret"]
 
-            env_costs[svc.name] = round(cost, 2)
+            # Multiply by region count for multi-region deployments
+            env_costs[svc.name] = round(cost * region_count, 2)
 
         env_costs["total"] = round(sum(env_costs.values()), 2)
         result[env] = env_costs

@@ -128,20 +128,28 @@ secrets are only mounted into the correct pods.
 
 ## Testing Strategy
 
-The test suite (118 tests) covers:
+The test suite (165 tests) covers:
 
 - **Parser**: field extraction, defaults, type conversion
 - **Graph**: peer detection, cycle finding (single/multiple/mixed), topological sort
 - **Validator**: every error condition, peer-info-not-error
 - **Terraform**: file count, backend isolation, SG directionality, ALB ingress,
   internal protection, DB isolation, tags, peer rules, peer-group tag
+- **ECS**: task definition (Fargate, CPU/memory, container defs, log config,
+  environment vars, health checks, secrets injection), IAM roles (execution +
+  task), role policy attachments, CloudWatch log groups (retention by env),
+  ECS service (launch type, network config, circuit breaker, public IP)
 - **Kubernetes**: file count, anti-affinity, topology spread, probe types,
   probe timing differences, HPA metrics, NetworkPolicy rules
 - **Drift**: forward-all-new, reverse-orphan, no-drift-after-generate, forward-db-change
-- **Cost**: basic, db+cache, replica scaling
+- **State drift**: local state reading, resource address extraction, missing/orphaned detection
+- **Cost**: basic, db+cache, replica scaling, multi-region multiplier
+- **Multi-region**: directory structure (single/multi), provider/backend per region,
+  K8s region labels, cost scaling, drift detection
+- **Region validation**: format validation, empty regions, duplicate regions
 - **Secrets**: model, parser, validator, Terraform (SM + IAM), Kubernetes
   (Secret + envFrom), cost, drift, CLI integration
-- **CLI**: validate/dry-run/generate/drift end-to-end
+- **CLI**: validate/dry-run/generate/drift/state-drift end-to-end
 
 All tests use in-memory manifests or temporary directories and have no
 external dependencies.
