@@ -1,0 +1,155 @@
+services:
+  # External API gateway - entry point
+  - name: api-gateway
+    port: 8080
+    dependencies:
+      - auth-service
+      - order-service
+      - product-catalog
+    db_type: none
+    cache: redis
+    exposure: external
+    health_check_path: /healthz
+    env_overrides:
+      dev:
+        replicas: 1
+        cpu: "250m"
+      staging:
+        replicas: 2
+        cpu: "500m"
+      prod:
+        replicas: 4
+        cpu: "1000m"
+
+  # Auth service - internal, has both db and cache
+  - name: auth-service
+    port: 8081
+    dependencies: []
+    db_type: postgres
+    cache: redis
+    exposure: internal
+    health_check_path: /health
+    env_overrides:
+      dev:
+        replicas: 1
+        cpu: "250m"
+      staging:
+        replicas: 2
+        cpu: "500m"
+      prod:
+        replicas: 3
+        cpu: "750m"
+
+  # Order service - internal, depends on inventory
+  - name: order-service
+    port: 8082
+    dependencies:
+      - inventory-service
+      - notification-service
+    db_type: postgres
+    cache: memcached
+    exposure: internal
+    env_overrides:
+      dev:
+        replicas: 1
+        cpu: "250m"
+      staging:
+        replicas: 2
+        cpu: "500m"
+      prod:
+        replicas: 3
+        cpu: "750m"
+
+  # Inventory service - internal, PEER with order-service (mutual dependency)
+  # This is a valid 2-service mutual dependency (peer relationship), NOT a cycle error.
+  - name: inventory-service
+    port: 8083
+    dependencies:
+      - order-service
+    db_type: mysql
+    cache: none
+    exposure: internal
+    health_check_path: /ready
+    env_overrides:
+      dev:
+        replicas: 1
+        cpu: "200m"
+      staging:
+        replicas: 2
+        cpu: "400m"
+      prod:
+        replicas: 3
+        cpu: "600m"
+
+  # Product catalog - external
+  - name: product-catalog
+    port: 8084
+    dependencies:
+      - inventory-service
+    db_type: postgres
+    cache: redis
+    exposure: external
+    health_check_path: /api/health
+    env_overrides:
+      dev:
+        replicas: 1
+        cpu: "250m"
+      staging:
+        replicas: 2
+        cpu: "500m"
+      prod:
+        replicas: 4
+        cpu: "1000m"
+
+  # Notification service - internal
+  - name: notification-service
+    port: 8085
+    dependencies: []
+    db_type: none
+    cache: none
+    exposure: internal
+    env_overrides:
+      dev:
+        replicas: 1
+        cpu: "100m"
+      staging:
+        replicas: 1
+        cpu: "200m"
+      prod:
+        replicas: 2
+        cpu: "400m"
+
+# --- Uncomment below to test TRUE cycle detection (3+ services) ---
+# Add these to trigger a cycle error:
+#  - name: cycle-a
+#    port: 9001
+#    dependencies: [cycle-b]
+#    db_type: none
+#    cache: none
+#    exposure: internal
+#    env_overrides:
+#      dev: { replicas: 1, cpu: "100m" }
+#      staging: { replicas: 1, cpu: "100m" }
+#      prod: { replicas: 1, cpu: "100m" }
+#
+#  - name: cycle-b
+#    port: 9002
+#    dependencies: [cycle-c]
+#    db_type: none
+#    cache: none
+#    exposure: internal
+#    env_overrides:
+#      dev: { replicas: 1, cpu: "100m" }
+#      staging: { replicas: 1, cpu: "100m" }
+#      prod: { replicas: 1, cpu: "100m" }
+#
+#  - name: cycle-c
+#    port: 9003
+#    dependencies: [cycle-a]
+#    db_type: none
+#    cache: none
+#    exposure: internal
+#    env_overrides:
+#      dev: { replicas: 1, cpu: "100m" }
+#      staging: { replicas: 1, cpu: "100m" }
+#      prod: { replicas: 1, cpu: "100m" }

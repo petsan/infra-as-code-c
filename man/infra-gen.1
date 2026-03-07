@@ -1,0 +1,187 @@
+.\" Manpage for infra-gen
+.\" Contact: https://github.com/your-org/infra-gen/issues
+.TH INFRA-GEN 1 "2026-03-07" "infra-gen 1.0.0" "User Commands"
+.SH NAME
+infra-gen \- generate multi-environment infrastructure-as-code from YAML manifests
+.SH SYNOPSIS
+.B infra-gen
+[\fB\-h\fR]
+[\fB\-o\fR \fIDIR\fR]
+[\fB\-\-validate\fR]
+[\fB\-\-dry\-run\fR]
+[\fB\-\-drift\fR]
+[\fB\-\-version\fR]
+.I MANIFEST
+.SH DESCRIPTION
+.B infra-gen
+reads a declarative YAML service manifest and generates production-ready
+Terraform modules and Kubernetes manifests for multiple environments
+(dev, staging, prod).
+.PP
+The tool enforces strict security-group directionality, handles two-service
+mutual dependencies as "peer relationships" with bidirectional rules,
+detects circular dependencies involving 3+ services, performs bidirectional
+drift analysis, estimates monthly AWS costs, and validates manifest
+correctness before generation.
+.SH OPTIONS
+.TP
+.I MANIFEST
+Path to the YAML manifest file defining services, dependencies, databases,
+caches, and per-environment resource overrides.  This argument is required.
+.TP
+.BR \-o ", " \-\-output " " \fIDIR\fR
+Root output directory for generated files.  Terraform modules are written to
+\fIDIR\fR/terraform/<env>/ and Kubernetes manifests to
+\fIDIR\fR/kubernetes/<env>/.  Default: \fBoutput\fR.
+.TP
+.B \-\-validate
+Validate the manifest and exit without generating any files.  Checks
+dependency existence, self-references, CPU format (must match \fB^[0-9]+m$\fR),
+replica counts (must be > 0), replica ordering (\fBprod >= staging >= dev\fR),
+and circular dependencies (3+ services).  Two-service mutual dependencies are
+reported as informational peer relationships.  Exit code 0 means the manifest
+is valid; exit code 1 means errors were found.
+.TP
+.B \-\-dry\-run
+Preview what would be generated without writing any files.  Displays detected
+peer relationships, the topological resource creation order, and estimated
+monthly AWS costs per environment broken down by service.
+.TP
+.B \-\-drift
+Detect drift between the manifest and previously generated output files.
+Reports forward drift (new or changed resources) and reverse drift (orphaned
+files from services no longer in the manifest).  Exits with code 1 if
+orphaned resources are found.
+.TP
+.B \-\-version
+Print the program version and exit.
+.TP
+.BR \-h ", " \-\-help
+Show the help message and exit.
+.SH MANIFEST FORMAT
+The YAML manifest must contain a top-level \fBservices\fR list.  Each entry
+supports the following fields:
+.TP
+.B name
+(required) Unique service identifier used as a resource name prefix.
+.TP
+.B port
+(required) Primary container listening port (integer).
+.TP
+.B dependencies
+List of other service names that this service depends on.  Dependency edges
+drive security-group rules and topological ordering.  Default: empty list.
+.TP
+.B db_type
+Database engine: \fBpostgres\fR, \fBmysql\fR, or \fBnone\fR.  Default:
+\fBnone\fR.
+.TP
+.B cache
+Cache engine: \fBredis\fR, \fBmemcached\fR, or \fBnone\fR.  Default:
+\fBnone\fR.
+.TP
+.B exposure
+Network exposure: \fBinternal\fR or \fBexternal\fR.  External services
+receive ALB ingress on port 443 from 0.0.0.0/0.  Internal services never
+get public ingress.  Default: \fBinternal\fR.
+.TP
+.B health_check_path
+Optional HTTP path for Kubernetes readiness probes (e.g. \fB/healthz\fR).
+When omitted, a TCP socket probe is used instead.
+.TP
+.B env_overrides
+Per-environment settings.  Must include \fBdev\fR, \fBstaging\fR, and
+\fBprod\fR keys, each with:
+.RS
+.TP
+.B replicas
+Integer > 0.  Must satisfy \fBprod >= staging >= dev\fR.
+.TP
+.B cpu
+Kubernetes millicore string matching \fB^[0-9]+m$\fR (e.g. \fB"250m"\fR).
+.RE
+.SH SECURITY GROUP RULES
+.TP
+.B Directional
+If service A depends on service B, then A can reach B on B's port.  B gets
+an ingress rule from A's security group.
+.TP
+.B External ingress
+Services with \fBexposure: external\fR receive an ALB ingress rule on port
+443 from 0.0.0.0/0.
+.TP
+.B Internal protection
+Services with \fBexposure: internal\fR never receive 0.0.0.0/0 ingress,
+even if external services depend on them.
+.TP
+.B Database SGs
+Database security groups only allow inbound traffic from the owning
+service's security group on port 5432 (Postgres) or 3306 (MySQL).
+.TP
+.B Peer relationships
+If exactly two services mutually depend on each other (A depends on B and
+B depends on A), they form a "peer pair".  Peer pairs receive bidirectional
+security-group rules (both ingress and egress in each direction) and are
+tagged with a \fBpeer-group\fR label.  They are not treated as cycles.
+.SH COST ESTIMATION
+The \fB\-\-dry\-run\fR flag includes estimated monthly AWS costs using
+the following on-demand prices (us-east-1):
+.PP
+.nf
+  t3.micro       $7.49/mo   (one per replica)
+  db.t3.micro    $12.25/mo  (one per service with db_type != none)
+  cache.t3.micro $11.52/mo  (one per service with cache != none)
+.fi
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Validation failure, parse error, cycle detected, or orphaned resources
+found during drift detection.
+.SH EXAMPLES
+Validate a manifest:
+.PP
+.nf
+  infra-gen services.yaml \-\-validate
+.fi
+.PP
+Dry-run with cost estimation:
+.PP
+.nf
+  infra-gen services.yaml \-\-dry\-run
+.fi
+.PP
+Generate all infrastructure files:
+.PP
+.nf
+  infra-gen services.yaml \-o infra
+.fi
+.PP
+Detect drift against existing output:
+.PP
+.nf
+  infra-gen services.yaml \-\-drift \-o infra
+.fi
+.SH FILES
+.TP
+.I <output>/terraform/<env>/backend.tf.json
+S3 + DynamoDB state backend per environment.
+.TP
+.I <output>/terraform/<env>/provider.tf.json
+AWS provider configuration with default tags.
+.TP
+.I <output>/terraform/<env>/<service>.tf.json
+Per-service Terraform resources (security groups, RDS, ElastiCache, ECS).
+.TP
+.I <output>/kubernetes/<env>/<service>.yaml
+Multi-document YAML containing Deployment, Service, NetworkPolicy, and HPA.
+.SH SEE ALSO
+.BR terraform (1),
+.BR kubectl (1),
+.BR aws (1)
+.SH BUGS
+Report bugs at: https://github.com/your-org/infra-gen/issues
+.SH AUTHORS
+infra-gen contributors.

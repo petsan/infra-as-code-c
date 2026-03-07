@@ -1,0 +1,85 @@
+site_name: infra-gen Documentation
+site_description: Generate production-ready multi-environment Terraform and Kubernetes from YAML manifests
+site_url: https://infra-gen.readthedocs.io
+
+repo_name: your-org/infra-gen
+repo_url: https://github.com/your-org/infra-gen
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_root_heading: true
+            heading_level: 2
+            docstring_style: numpy
+            show_signature_annotations: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets
+  - toc:
+      permalink: true
+  - attr_list
+  - def_list
+  - tables
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quick Start: getting-started/quickstart.md
+  - User Guide:
+      - Manifest Format: guide/manifest.md
+      - Terraform Output: guide/terraform.md
+      - Kubernetes Output: guide/kubernetes.md
+      - Validation: guide/validation.md
+      - Drift Detection: guide/drift.md
+      - Cost Estimation: guide/cost.md
+      - Peer Relationships: guide/peers.md
+  - CLI Reference: cli-reference.md
+  - API Reference:
+      - Models: api/models.md
+      - Parser: api/parser.md
+      - Graph: api/graph.md
+      - Validator: api/validator.md
+      - Terraform Generator: api/terraform.md
+      - Kubernetes Generator: api/kubernetes.md
+      - Drift Detection: api/drift.md
+      - Cost Estimation: api/cost.md
+  - Architecture: architecture.md
