@@ -336,6 +336,45 @@ def _write_service_module(
             "tags": cache_tags,
         }
 
+    # Secrets Manager
+    if svc.has_secrets:
+        secret_arns: list[str] = []
+        for secret_name in svc.secrets:
+            sm_key = f"aws_secretsmanager_secret_{_tf_name(svc.name)}_{secret_name.lower()}"
+            full_name = f"{svc.name}/{env}/{secret_name}"
+            resources[sm_key] = {
+                "type": "aws_secretsmanager_secret",
+                "name": full_name,
+                "description": f"Secret {secret_name} for {svc.name} in {env}",
+                "tags": tags,
+            }
+            resources[f"{sm_key}_version"] = {
+                "type": "aws_secretsmanager_secret_version",
+                "secret_id": f"${{aws_secretsmanager_secret.{sm_key}.id}}",
+                "secret_string": "CHANGE_ME",
+            }
+            secret_arns.append(f"${{aws_secretsmanager_secret.{sm_key}.arn}}")
+
+        resources[f"aws_iam_policy_{_tf_name(svc.name)}_secrets"] = {
+            "type": "aws_iam_policy",
+            "name": f"{svc.name}-{env}-secrets-read",
+            "description": f"Allow {svc.name} to read its secrets in {env}",
+            "policy": {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "secretsmanager:GetSecretValue",
+                            "secretsmanager:DescribeSecret",
+                        ],
+                        "Resource": secret_arns,
+                    }
+                ],
+            },
+            "tags": tags,
+        }
+
     # ECS / compute
     ov = svc.env_overrides.get(env)
     if ov:

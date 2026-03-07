@@ -1001,3 +1001,301 @@ class TestTerraformEdgeCases:
         )
         tags = provider["provider"]["aws"]["default_tags"]["tags"]
         assert tags["environment"] == "prod"
+
+
+# ---- Secrets / Vault tests ----
+
+
+class TestSecretsModel:
+    def test_has_secrets_true(self):
+        svc = _svc("a")
+        svc.secrets = ["DB_PASSWORD", "API_KEY"]
+        assert svc.has_secrets is True
+
+    def test_has_secrets_false(self):
+        svc = _svc("a")
+        assert svc.has_secrets is False
+
+    def test_secrets_default_empty(self):
+        svc = _svc("a")
+        assert svc.secrets == []
+
+
+class TestSecretsParser:
+    def test_parse_secrets_from_yaml(self, tmpdir):
+        """Parser reads the secrets list from YAML."""
+        manifest_path = Path(tmpdir) / "svc.yaml"
+        manifest_path.write_text(
+            "services:\n"
+            "  - name: web\n"
+            "    port: 8080\n"
+            "    secrets:\n"
+            "      - DB_PASSWORD\n"
+            "      - API_KEY\n"
+            "    env_overrides:\n"
+            "      dev: {replicas: 1, cpu: '250m'}\n"
+            "      staging: {replicas: 2, cpu: '500m'}\n"
+            "      prod: {replicas: 3, cpu: '750m'}\n"
+        )
+        manifest = parse_manifest(str(manifest_path))
+        svc = manifest.services[0]
+        assert svc.secrets == ["DB_PASSWORD", "API_KEY"]
+
+    def test_parse_no_secrets_defaults_empty(self, tmpdir):
+        """Services without a secrets key default to an empty list."""
+        manifest_path = Path(tmpdir) / "svc.yaml"
+        manifest_path.write_text(
+            "services:\n"
+            "  - name: web\n"
+            "    port: 8080\n"
+            "    env_overrides:\n"
+            "      dev: {replicas: 1, cpu: '250m'}\n"
+            "      staging: {replicas: 2, cpu: '500m'}\n"
+            "      prod: {replicas: 3, cpu: '750m'}\n"
+        )
+        manifest = parse_manifest(str(manifest_path))
+        assert manifest.services[0].secrets == []
+
+
+class TestSecretsValidator:
+    def test_valid_secret_names(self):
+        svc = _svc("a")
+        svc.secrets = ["DB_PASSWORD", "API_KEY", "X"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert not any("secret" in e.message.lower() for e in real_errors)
+
+    def test_invalid_secret_name_lowercase(self):
+        svc = _svc("a")
+        svc.secrets = ["db_password"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert any("invalid secret name" in e.message for e in real_errors)
+
+    def test_invalid_secret_name_starts_with_digit(self):
+        svc = _svc("a")
+        svc.secrets = ["3SECRET"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert any("invalid secret name" in e.message for e in real_errors)
+
+    def test_invalid_secret_name_with_hyphen(self):
+        svc = _svc("a")
+        svc.secrets = ["DB-PASSWORD"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert any("invalid secret name" in e.message for e in real_errors)
+
+    def test_duplicate_secret_names(self):
+        svc = _svc("a")
+        svc.secrets = ["DB_PASSWORD", "DB_PASSWORD"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert any("duplicate secret names" in e.message for e in real_errors)
+
+    def test_empty_secrets_no_error(self):
+        svc = _svc("a")
+        svc.secrets = []
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert not any("secret" in e.message.lower() for e in real_errors)
+
+
+class TestSecretsTerraform:
+    def test_secrets_manager_resources_created(self, tmpdir):
+        """Each secret gets a SecretsManager secret + version."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD", "API_KEY"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        resources = tf["resource"]
+        # Secret resources
+        assert "aws_secretsmanager_secret_web_db_password" in resources
+        assert "aws_secretsmanager_secret_web_api_key" in resources
+        # Version resources
+        assert "aws_secretsmanager_secret_web_db_password_version" in resources
+        assert "aws_secretsmanager_secret_web_api_key_version" in resources
+
+    def test_secrets_manager_name_includes_env(self, tmpdir):
+        """Secret name follows <service>/<env>/<SECRET_NAME> pattern."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        sm = tf["resource"]["aws_secretsmanager_secret_web_db_password"]
+        assert sm["name"] == "web/prod/DB_PASSWORD"
+
+    def test_secrets_iam_policy_created(self, tmpdir):
+        """An IAM policy for reading secrets is created."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        resources = tf["resource"]
+        policy = resources["aws_iam_policy_web_secrets"]
+        assert policy["type"] == "aws_iam_policy"
+        stmt = policy["policy"]["Statement"][0]
+        assert "secretsmanager:GetSecretValue" in stmt["Action"]
+        assert len(stmt["Resource"]) == 1
+
+    def test_no_secrets_no_sm_resources(self, tmpdir):
+        """Services without secrets don't get SecretsManager resources."""
+        manifest = Manifest(services=[_svc("web")])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        resources = tf["resource"]
+        sm_keys = [k for k in resources if "secretsmanager" in k]
+        assert sm_keys == []
+
+    def test_secrets_version_placeholder(self, tmpdir):
+        """Secret versions use CHANGE_ME as placeholder."""
+        svc = _svc("web")
+        svc.secrets = ["TOKEN"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        version = tf["resource"]["aws_secretsmanager_secret_web_token_version"]
+        assert version["secret_string"] == "CHANGE_ME"
+
+
+class TestSecretsKubernetes:
+    def test_secret_resource_created(self, tmpdir):
+        """K8s Secret resource is created when service has secrets."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD", "API_KEY"]
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        # Deployment, Service, NetworkPolicy, HPA, Secret
+        assert len(docs) == 5
+        secret = docs[4]
+        assert secret["kind"] == "Secret"
+        assert secret["type"] == "Opaque"
+        assert "DB_PASSWORD" in secret["data"]
+        assert "API_KEY" in secret["data"]
+
+    def test_secret_namespace_matches_env(self, tmpdir):
+        svc = _svc("web")
+        svc.secrets = ["TOKEN"]
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        for env in ["dev", "staging", "prod"]:
+            path = Path(tmpdir) / "kubernetes" / env / "web.yaml"
+            docs = list(yaml.safe_load_all(path.read_text()))
+            secret = docs[4]
+            assert secret["metadata"]["namespace"] == env
+
+    def test_deployment_envfrom_references_secret(self, tmpdir):
+        """Deployment container has envFrom referencing the secret."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD"]
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        container = docs[0]["spec"]["template"]["spec"]["containers"][0]
+        assert "envFrom" in container
+        assert container["envFrom"][0]["secretRef"]["name"] == "web-secrets"
+
+    def test_no_secrets_no_secret_resource(self, tmpdir):
+        """Services without secrets don't get a Secret resource."""
+        manifest = Manifest(services=[_svc("web")])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        assert len(docs) == 4  # Deployment, Service, NetworkPolicy, HPA
+        kinds = [d["kind"] for d in docs]
+        assert "Secret" not in kinds
+
+    def test_no_secrets_no_envfrom(self, tmpdir):
+        """Containers without secrets don't have envFrom."""
+        manifest = Manifest(services=[_svc("web")])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        container = docs[0]["spec"]["template"]["spec"]["containers"][0]
+        assert "envFrom" not in container
+
+    def test_secret_data_placeholder(self, tmpdir):
+        """Secret data values are base64 CHANGE_ME placeholders."""
+        svc = _svc("web")
+        svc.secrets = ["TOKEN"]
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        secret = docs[4]
+        assert secret["data"]["TOKEN"] == "Q0hBTkdFX01F"
+
+
+class TestSecretsCost:
+    def test_cost_includes_secrets(self):
+        """Each secret adds $0.40/mo."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD", "API_KEY"]
+        costs = estimate_costs(Manifest(services=[svc]))
+        # dev: 1*7.49 + 2*0.40 = 8.29
+        assert costs["dev"]["web"] == 8.29
+
+    def test_cost_no_secrets(self):
+        """No secrets means no extra cost."""
+        costs = estimate_costs(Manifest(services=[_svc("web")]))
+        assert costs["dev"]["web"] == 7.49
+
+
+class TestSecretsDrift:
+    def test_forward_drift_secrets_added(self, tmpdir):
+        """Adding secrets to a service is detected as forward drift."""
+        manifest = Manifest(services=[_svc("web")])
+        generate_terraform(manifest, tmpdir)
+        generate_kubernetes(manifest, tmpdir)
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD"]
+        modified = Manifest(services=[svc])
+        report = detect_drift(modified, tmpdir)
+        forward = report["forward"]
+        assert any(
+            item["service"] == "web" and "Secrets Manager resources will be added" in item["reason"]
+            for item in forward
+        )
+
+    def test_forward_drift_secrets_removed(self, tmpdir):
+        """Removing secrets from a service is detected as forward drift."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        generate_kubernetes(manifest, tmpdir)
+        clean = Manifest(services=[_svc("web")])
+        report = detect_drift(clean, tmpdir)
+        forward = report["forward"]
+        assert any(
+            item["service"] == "web"
+            and "Secrets Manager resources will be removed" in item["reason"]
+            for item in forward
+        )
+
+
+class TestSecretsCLI:
+    def test_validate_sample_with_secrets(self):
+        """sample.yaml (which now has secrets) validates cleanly."""
+        rc = main(["sample.yaml", "--validate"])
+        assert rc == 0
+
+    def test_generate_with_secrets(self, tmpdir):
+        """Full generation with secrets succeeds."""
+        rc = main(["sample.yaml", "-o", tmpdir])
+        assert rc == 0
+        # Verify secrets manager resources in terraform
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api-gateway.tf.json").read_text())
+        resources = tf["resource"]
+        assert any("secretsmanager" in k for k in resources)
+        # Verify k8s secret resource
+        path = Path(tmpdir) / "kubernetes" / "prod" / "api-gateway.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        kinds = [d["kind"] for d in docs]
+        assert "Secret" in kinds

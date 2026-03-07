@@ -16,6 +16,7 @@ Costs are calculated using fixed on-demand prices for `us-east-1`:
 | `t3.micro` | $7.49 | One per replica (from `env_overrides`) |
 | `db.t3.micro` | $12.25 | One per service with `db_type != none` |
 | `cache.t3.micro` | $11.52 | One per service with `cache != none` |
+| secret | $0.40 | One per secret declared in `secrets` |
 
 ## Calculation
 
@@ -25,6 +26,7 @@ For each service in each environment:
 cost = (replicas x $7.49)
      + ($12.25 if db_type != none)
      + ($11.52 if cache != none)
+     + (num_secrets x $0.40)
 ```
 
 ## Example Output
@@ -80,3 +82,4 @@ These estimates are for planning purposes only.  They do **not** include:
 - ALB hourly costs and LCU charges
 - CloudWatch, S3, or DynamoDB costs for state management
 - Multi-AZ RDS or ElastiCache replication
+- Secrets Manager API call costs (beyond the per-secret monthly fee)

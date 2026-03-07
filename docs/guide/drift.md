@@ -14,8 +14,9 @@ is re-run.  This includes:
 
 - **New services** -- a service exists in the manifest but its output files
   do not yet exist.
-- **Structural changes** -- a service's `db_type` or `cache` has changed
-  (e.g. a database was added or removed).
+- **Structural changes** -- a service's `db_type`, `cache`, or `secrets`
+  have changed (e.g. a database was added, a cache was removed, or secrets
+  were added/removed).
 
 ```
 === FORWARD DRIFT (changes to apply) ===
@@ -77,7 +78,7 @@ rm output/kubernetes/*/removed-service.yaml
 
 | Output type | Forward detection | Reverse detection |
 |-------------|-------------------|-------------------|
-| Terraform | Missing `.tf.json` files; structural changes (db/cache added or removed) | `.tf.json` files whose service name is not in the manifest |
+| Terraform | Missing `.tf.json` files; structural changes (db/cache/secrets added or removed) | `.tf.json` files whose service name is not in the manifest |
 | Kubernetes | Missing `.yaml` files | `.yaml` files whose service name is not in the manifest |
 
 Backend and provider files (`backend.tf.json`, `provider.tf.json`) are

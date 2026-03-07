@@ -71,6 +71,7 @@ nav:
       - Validation: guide/validation.md
       - Drift Detection: guide/drift.md
       - Cost Estimation: guide/cost.md
+      - Secrets Vault: guide/secrets.md
       - Peer Relationships: guide/peers.md
   - CLI Reference: cli-reference.md
   - API Reference:

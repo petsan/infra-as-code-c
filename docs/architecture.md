@@ -59,9 +59,9 @@ Python's `json.dumps` produces valid output deterministically.
 ### Multi-Document YAML for Kubernetes
 
 Each service's Kubernetes file contains four resources (Deployment, Service,
-NetworkPolicy, HPA) in a single multi-document YAML file.  This keeps
-related resources together and allows `kubectl apply -f <file>` to create
-everything in one command.
+NetworkPolicy, HPA) -- or five if the service declares secrets (plus a
+Secret resource).  This keeps related resources together and allows
+`kubectl apply -f <file>` to create everything in one command.
 
 ### Peer Detection Before Cycle Detection
 
@@ -117,9 +117,18 @@ Database and cache security groups use a separate security group that only
 allows inbound from the owning service's security group.  No other service
 can reach the database or cache directly.
 
+### Secrets Isolation
+
+Each service's secrets are stored in per-environment, per-service paths in
+AWS Secrets Manager (e.g. `auth-service/prod/DB_PASSWORD`).  An IAM policy
+scoped to exactly that service's secret ARNs is generated -- no service can
+read another service's secrets.  On the Kubernetes side, each service gets
+its own namespaced `Secret` resource with `envFrom` injection, ensuring
+secrets are only mounted into the correct pods.
+
 ## Testing Strategy
 
-The test suite (49 tests) covers:
+The test suite (118 tests) covers:
 
 - **Parser**: field extraction, defaults, type conversion
 - **Graph**: peer detection, cycle finding (single/multiple/mixed), topological sort
@@ -130,6 +139,8 @@ The test suite (49 tests) covers:
   probe timing differences, HPA metrics, NetworkPolicy rules
 - **Drift**: forward-all-new, reverse-orphan, no-drift-after-generate, forward-db-change
 - **Cost**: basic, db+cache, replica scaling
+- **Secrets**: model, parser, validator, Terraform (SM + IAM), Kubernetes
+  (Secret + envFrom), cost, drift, CLI integration
 - **CLI**: validate/dry-run/generate/drift end-to-end
 
 All tests use in-memory manifests or temporary directories and have no

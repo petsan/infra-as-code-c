@@ -33,6 +33,7 @@ COSTS: dict[str, float] = {
     "t3.micro": 7.49,
     "db.t3.micro": 12.25,
     "cache.t3.micro": 11.52,
+    "secret": 0.40,
 }
 """Monthly on-demand prices (USD) for each instance type."""
 
@@ -77,6 +78,10 @@ def estimate_costs(manifest: Manifest) -> dict[str, dict[str, float]]:
             # Cache
             if svc.has_cache:
                 cost += COSTS["cache.t3.micro"]
+
+            # Secrets Manager (per secret)
+            if svc.has_secrets:
+                cost += len(svc.secrets) * COSTS["secret"]
 
             env_costs[svc.name] = round(cost, 2)
 

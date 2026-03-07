@@ -148,6 +148,28 @@ def detect_drift(manifest: Manifest, output_dir: str) -> dict[str, list[dict[str
                         }
                     )
 
+                has_secrets_resource = any("secretsmanager" in k for k in existing_resources)
+                if svc.has_secrets and not has_secrets_resource:
+                    report["forward"].append(
+                        {
+                            "type": "terraform",
+                            "environment": env,
+                            "service": svc_name,
+                            "action": "update",
+                            "reason": "Secrets Manager resources will be added",
+                        }
+                    )
+                elif not svc.has_secrets and has_secrets_resource:
+                    report["forward"].append(
+                        {
+                            "type": "terraform",
+                            "environment": env,
+                            "service": svc_name,
+                            "action": "update",
+                            "reason": "Secrets Manager resources will be removed",
+                        }
+                    )
+
     # Check Kubernetes files
     k8s_dir = Path(output_dir) / "kubernetes"
     if k8s_dir.exists():

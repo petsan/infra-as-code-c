@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "infra-gen"
-version = "0.1.0"
+version = "0.1.1"
 description = "Generate production-ready multi-environment infrastructure-as-code from YAML manifests"
 readme = "README.md"
 requires-python = ">=3.10"

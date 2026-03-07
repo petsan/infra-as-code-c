@@ -153,4 +153,5 @@ The peer pair passes, but the three-service cycle is flagged as an error.
 - [Manifest Format](../guide/manifest.md) -- full field reference
 - [Terraform Output](../guide/terraform.md) -- what gets generated
 - [Kubernetes Output](../guide/kubernetes.md) -- deployment details
+- [Secrets Vault](../guide/secrets.md) -- managing secrets with AWS Secrets Manager
 - [Peer Relationships](../guide/peers.md) -- how mutual dependencies work

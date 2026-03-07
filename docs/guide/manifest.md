@@ -36,6 +36,7 @@ service definitions.
 | `cache` | string | `"none"` | Cache engine: `redis`, `memcached`, or `none`. When not `none`, an ElastiCache cluster and cache security group are provisioned. |
 | `exposure` | string | `"internal"` | Network exposure: `internal` or `external`. External services get ALB ingress on port 443. Internal services are guaranteed no public ingress. |
 | `health_check_path` | string | *null* | HTTP path for Kubernetes readiness probes (e.g. `/healthz`). When omitted, a TCP socket probe is used instead. |
+| `secrets` | list of strings | `[]` | Secret names required at runtime (e.g. `DB_PASSWORD`, `API_KEY`). Names must match `^[A-Z][A-Z0-9_]*$`. See [Secrets Vault](secrets.md). |
 | `env_overrides` | mapping | `{}` | Per-environment overrides (see below). |
 
 ### Environment Overrides
@@ -65,7 +66,7 @@ env_overrides:
 
 ```yaml
 services:
-  # External API gateway with Redis cache
+  # External API gateway with Redis cache and secrets
   - name: api-gateway
     port: 8080
     dependencies:
@@ -75,12 +76,15 @@ services:
     cache: redis
     exposure: external
     health_check_path: /healthz
+    secrets:
+      - JWT_SECRET
+      - RATE_LIMIT_KEY
     env_overrides:
       dev:     { replicas: 1, cpu: "250m" }
       staging: { replicas: 2, cpu: "500m" }
       prod:    { replicas: 4, cpu: "1000m" }
 
-  # Internal auth service with Postgres + Redis
+  # Internal auth service with Postgres + Redis and secrets
   - name: auth-service
     port: 8081
     dependencies: []
@@ -88,6 +92,9 @@ services:
     cache: redis
     exposure: internal
     health_check_path: /health
+    secrets:
+      - DB_PASSWORD
+      - OAUTH_CLIENT_SECRET
     env_overrides:
       dev:     { replicas: 1, cpu: "250m" }
       staging: { replicas: 2, cpu: "500m" }
@@ -128,3 +135,9 @@ services:
 - Circular dependencies involving 3 or more services are errors that block generation.
 
 See [Peer Relationships](peers.md) for details on how peer pairs are handled.
+
+## Secrets
+
+Services can declare secrets they need at runtime.  Names must be uppercase
+with underscores (`^[A-Z][A-Z0-9_]*$`).  See [Secrets Vault](secrets.md)
+for full setup and usage instructions.

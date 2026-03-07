@@ -77,6 +77,7 @@ def parse_manifest(path: str | Path) -> Manifest:
                 exposure=svc.get("exposure", "internal"),
                 health_check_path=svc.get("health_check_path"),
                 env_overrides=env_overrides,
+                secrets=svc.get("secrets", []),
             )
         )
 

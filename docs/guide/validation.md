@@ -61,7 +61,18 @@ higher environments always have at least as much capacity as lower ones.
 [ERROR] Service 'api': replica ordering violated - prod(1) >= staging(5) >= dev(3) required
 ```
 
-### 7. Circular Dependencies (3+ services)
+### 7. Secret Names
+
+Secret names must match `^[A-Z][A-Z0-9_]*$` (uppercase letters, digits, and
+underscores, starting with a letter).  Duplicate names within a service are
+also rejected.
+
+```
+[ERROR] Service 'api': invalid secret name 'db_password' (must match ^[A-Z][A-Z0-9_]*$)
+[ERROR] Service 'api': duplicate secret names
+```
+
+### 8. Circular Dependencies (3+ services)
 
 True cycles involving three or more services are errors.  The validator
 finds **all** cycles in the graph, not just the first one.
@@ -70,7 +81,7 @@ finds **all** cycles in the graph, not just the first one.
 [ERROR] True cycle detected (3+ services): a -> b -> c -> a
 ```
 
-### 8. Peer Relationships (informational)
+### 9. Peer Relationships (informational)
 
 Two-service mutual dependencies are reported as `INFO` messages and do
 **not** block generation.

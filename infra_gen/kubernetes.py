@@ -172,17 +172,7 @@ def _generate_service_manifests(
                         }
                     ],
                     "containers": [
-                        {
-                            "name": svc.name,
-                            "image": f"{svc.name}:latest",
-                            "ports": [{"containerPort": svc.port}],
-                            "resources": {
-                                "requests": {"cpu": cpu, "memory": "128Mi"},
-                                "limits": {"cpu": cpu, "memory": "256Mi"},
-                            },
-                            "readinessProbe": readiness_probe,
-                            "livenessProbe": liveness_probe,
-                        }
+                        _container_spec(svc, cpu, readiness_probe, liveness_probe),
                     ],
                 },
             },
@@ -260,7 +250,52 @@ def _generate_service_manifests(
     }
     docs.append(hpa)
 
+    # --- Secret (only if service declares secrets) ---
+    if svc.has_secrets:
+        secret = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": f"{svc.name}-secrets",
+                "namespace": env,
+                "labels": labels,
+            },
+            "type": "Opaque",
+            "data": {name: "Q0hBTkdFX01F" for name in svc.secrets},  # base64("CHANGE_ME")
+        }
+        docs.append(secret)
+
     return docs
+
+
+def _container_spec(
+    svc: Service,
+    cpu: str,
+    readiness_probe: dict[str, Any],
+    liveness_probe: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the container dict for a Deployment pod spec.
+
+    When the service declares secrets, an ``envFrom`` entry referencing
+    ``<service>-secrets`` is added so all secret keys are injected as
+    environment variables.
+    """
+    container: dict[str, Any] = {
+        "name": svc.name,
+        "image": f"{svc.name}:latest",
+        "ports": [{"containerPort": svc.port}],
+        "resources": {
+            "requests": {"cpu": cpu, "memory": "128Mi"},
+            "limits": {"cpu": cpu, "memory": "256Mi"},
+        },
+        "readinessProbe": readiness_probe,
+        "livenessProbe": liveness_probe,
+    }
+    if svc.has_secrets:
+        container["envFrom"] = [
+            {"secretRef": {"name": f"{svc.name}-secrets"}},
+        ]
+    return container
 
 
 def _readiness_probe(svc: Service) -> dict[str, Any]:

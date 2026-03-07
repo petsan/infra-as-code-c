@@ -51,6 +51,10 @@ class Service:
             instead.
         env_overrides: Mapping of environment name (``"dev"``, ``"staging"``,
             ``"prod"``) to :class:`EnvOverride` instances.
+        secrets: List of secret names that the service requires at runtime
+            (e.g. ``["DB_PASSWORD", "API_KEY"]``).  Names must match
+            ``^[A-Z][A-Z0-9_]*$``.  Secrets are provisioned in AWS Secrets
+            Manager (Terraform) and mounted as a Kubernetes ``Secret``.
     """
 
     name: str
@@ -61,11 +65,17 @@ class Service:
     exposure: str
     health_check_path: str | None = None
     env_overrides: dict[str, EnvOverride] = field(default_factory=dict)
+    secrets: list[str] = field(default_factory=list)
 
     @property
     def has_db(self) -> bool:
         """Return *True* if the service provisions a database (``db_type != "none"``)."""
         return self.db_type != "none"
+
+    @property
+    def has_secrets(self) -> bool:
+        """Return *True* if the service declares any secrets."""
+        return len(self.secrets) > 0
 
     @property
     def has_cache(self) -> bool:

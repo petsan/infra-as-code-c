@@ -68,6 +68,10 @@ _EPILOG = textwrap.dedent("""\
         cache             redis | memcached | none (default: none)
         exposure          internal | external      (default: internal)
         health_check_path HTTP path for readiness probes (optional)
+        secrets           List of secret names (e.g. DB_PASSWORD, API_KEY).
+                          Provisioned in AWS Secrets Manager (Terraform) and
+                          mounted as Kubernetes Secrets. Names must match
+                          ^[A-Z][A-Z0-9_]*$.
         env_overrides     Per-environment replica and CPU settings:
                             dev:     { replicas: 1, cpu: "250m" }
                             staging: { replicas: 2, cpu: "500m" }
@@ -81,6 +85,7 @@ _EPILOG = textwrap.dedent("""\
       - prod replicas >= staging replicas >= dev replicas
       - True cycles (3+ services) are errors
       - 2-service mutual dependencies are valid "peer relationships"
+      - Secret names must match ^[A-Z][A-Z0-9_]*$ (no duplicates)
 
     security group rules (generated Terraform):
       - Directional: A depends on B -> A can reach B on B's port
@@ -91,6 +96,7 @@ _EPILOG = textwrap.dedent("""\
 
     cost estimation (--dry-run):
       t3.micro = $7.49/mo   db.t3.micro = $12.25/mo   cache.t3.micro = $11.52/mo
+      secret = $0.40/mo (per secret)
 
     For the full documentation visit: https://infra-gen.readthedocs.io
 """)
@@ -166,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.0",
+        version="%(prog)s 0.1.1",
     )
 
     args = parser.parse_args(argv)

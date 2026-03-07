@@ -65,6 +65,7 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
     svc_map = manifest.service_map()
     required_envs = ["dev", "staging", "prod"]
     cpu_regex = re.compile(r"^[0-9]+m$")
+    secret_regex = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
     for svc in manifest.services:
         # Self-references
@@ -105,6 +106,18 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
                         f"cpu must match ^[0-9]+m$, got '{ov.cpu}'"
                     )
                 )
+
+        # Secret name validation
+        for secret_name in svc.secrets:
+            if not secret_regex.match(secret_name):
+                errors.append(
+                    ValidationError(
+                        f"Service '{svc.name}': invalid secret name '{secret_name}' "
+                        f"(must match ^[A-Z][A-Z0-9_]*$)"
+                    )
+                )
+        if len(svc.secrets) != len(set(svc.secrets)):
+            errors.append(ValidationError(f"Service '{svc.name}': duplicate secret names"))
 
         # Replica ordering: prod >= staging >= dev
         if all(env in svc.env_overrides for env in required_envs):

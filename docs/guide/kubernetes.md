@@ -19,7 +19,8 @@ output/kubernetes/
 
 ## Resources per Service
 
-Each `<service>.yaml` contains four Kubernetes resources separated by `---`:
+Each `<service>.yaml` contains four Kubernetes resources separated by `---`
+(five if the service declares secrets):
 
 ### 1. Deployment
 
@@ -139,6 +140,41 @@ spec:
         name: memory
         target: { type: Utilization, averageUtilization: 80 }
 ```
+
+### 5. Secret (when `secrets` is non-empty)
+
+An Opaque Secret resource containing all declared secret names as keys with
+base64-encoded placeholder values:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: auth-service-secrets
+  namespace: prod
+  labels:
+    app: auth-service
+    environment: prod
+    exposure: internal
+type: Opaque
+data:
+  DB_PASSWORD: Q0hBTkdFX01F        # base64("CHANGE_ME")
+  OAUTH_CLIENT_SECRET: Q0hBTkdFX01F
+```
+
+The Deployment container automatically gets an `envFrom` entry:
+
+```yaml
+envFrom:
+  - secretRef:
+      name: auth-service-secrets
+```
+
+This injects all secret keys as environment variables.  Replace the
+placeholder values before applying -- see [Secrets Vault](secrets.md) for
+the full workflow.
+
+Services without secrets do **not** receive a Secret resource or `envFrom`.
 
 ## Labels and Annotations
 

@@ -10,7 +10,8 @@ A Python CLI tool that generates production-ready, multi-environment **Terraform
 - **Cycle detection** -- finds *all* circular dependencies (3+ services), not just the first
 - **Bidirectional drift detection** -- forward (pending changes) and reverse (orphaned resources)
 - **Cost estimation** -- estimated monthly AWS costs per environment
-- **Comprehensive validation** -- dependency checks, CPU format, replica ordering, self-references
+- **Secrets vault** -- AWS Secrets Manager + Kubernetes Secrets with scoped IAM policies
+- **Comprehensive validation** -- dependency checks, CPU format, replica ordering, secret names, self-references
 
 ## Prerequisites
 
@@ -66,6 +67,9 @@ services:
     cache: redis
     exposure: external
     health_check_path: /healthz
+    secrets:
+      - JWT_SECRET
+      - RATE_LIMIT_KEY
     env_overrides:
       dev:     { replicas: 1, cpu: "250m" }
       staging: { replicas: 2, cpu: "500m" }
@@ -78,6 +82,9 @@ services:
     cache: redis
     exposure: internal
     health_check_path: /health
+    secrets:
+      - DB_PASSWORD
+      - OAUTH_CLIENT_SECRET
     env_overrides:
       dev:     { replicas: 1, cpu: "250m" }
       staging: { replicas: 2, cpu: "500m" }
@@ -191,6 +198,7 @@ Each service in the `services` list supports:
 | `cache` | string | no | `"none"` | `redis`, `memcached`, or `none` |
 | `exposure` | string | no | `"internal"` | `internal` or `external` |
 | `health_check_path` | string | no | *null* | HTTP path for readiness probes |
+| `secrets` | list[string] | no | `[]` | Secret names (e.g. `DB_PASSWORD`). Must match `^[A-Z][A-Z0-9_]*$` |
 | `env_overrides` | mapping | no | `{}` | Per-env `replicas` and `cpu` |
 
 ### Environment Overrides
@@ -215,6 +223,8 @@ env_overrides:
 | Invalid replicas | `replicas must be > 0` |
 | Invalid CPU | `cpu must match ^[0-9]+m$` |
 | Replica ordering | `replica ordering violated - prod(N) >= staging(N) >= dev(N) required` |
+| Invalid secret name | `invalid secret name 'x' (must match ^[A-Z][A-Z0-9_]*$)` |
+| Duplicate secrets | `duplicate secret names` |
 | True cycle (3+) | `True cycle detected (3+ services): a -> b -> c -> a` |
 
 Two-service mutual dependencies are valid **peer relationships** and are reported as `[INFO]`.
@@ -231,6 +241,7 @@ Two-service mutual dependencies are valid **peer relationships** and are reporte
 | Peer pair (A, B) | Bidirectional ingress + egress between A and B |
 | `db_type != none` | DB security group: inbound only from owning service |
 | `cache != none` | Cache security group: inbound only from owning service |
+| `secrets` non-empty | Secrets Manager secrets + IAM policy scoped to owning service |
 
 ### Tags on Every Resource
 
@@ -248,6 +259,7 @@ Each environment gets its own S3 bucket (`terraform-state-<env>`) and DynamoDB l
 | **Service** | ClusterIP on the container port |
 | **NetworkPolicy** | Internal pods reject traffic from `exposure: external` pods |
 | **HPA** | CPU target 70%, memory target 80% |
+| **Secret** | Opaque secret with `envFrom` injection (only when `secrets` is non-empty) |
 
 ### Probes
 
@@ -265,6 +277,7 @@ The `--dry-run` flag shows estimated monthly AWS costs:
 | `t3.micro` | $7.49/mo | One per replica |
 | `db.t3.micro` | $12.25/mo | One per service with `db_type != none` |
 | `cache.t3.micro` | $11.52/mo | One per service with `cache != none` |
+| secret | $0.40/mo | One per secret in `secrets` |
 
 ## Peer Relationships
 
@@ -275,6 +288,44 @@ When exactly two services mutually depend on each other (A depends on B **and** 
 3. They are tagged with `peer-group: <sorted-names>` (e.g. `inventory-service-order-service`)
 4. They are skipped in cycle detection
 5. True cycles are 3+ services only
+
+## Secrets Vault
+
+Services can declare secrets they need at runtime:
+
+```yaml
+secrets:
+  - DB_PASSWORD
+  - API_KEY
+```
+
+This generates:
+
+| Output | Resource | Description |
+|--------|----------|-------------|
+| Terraform | `aws_secretsmanager_secret` | One per secret, named `<service>/<env>/<NAME>` |
+| Terraform | `aws_secretsmanager_secret_version` | Placeholder value `CHANGE_ME` |
+| Terraform | `aws_iam_policy` | Grants `GetSecretValue` scoped to the service's secrets only |
+| Kubernetes | `Secret` | Opaque secret with base64 placeholder values |
+| Kubernetes | `envFrom` | Added to the Deployment container to inject secrets as env vars |
+
+After applying Terraform, replace the placeholder values:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id "auth-service/prod/DB_PASSWORD" \
+  --secret-string "real-password-here" \
+  --region us-east-1
+```
+
+For Kubernetes, either edit the generated YAML or use `kubectl create secret`:
+
+```bash
+kubectl create secret generic auth-service-secrets \
+  --namespace prod \
+  --from-literal=DB_PASSWORD="real-password-here" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
 
 ## Applying the Generated Files
 
@@ -366,7 +417,7 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-49 tests covering: parsing, graph algorithms (peers, cycles, topological sort), validation (every error case), Terraform output (SG directionality, ALB ingress, internal protection, DB isolation, tags, peers), Kubernetes output (anti-affinity, topology spread, probes, HPA, NetworkPolicy), drift detection (forward, reverse, no-drift, structural changes), cost estimation, and CLI end-to-end.
+118 tests covering: parsing, graph algorithms (peers, cycles, topological sort), validation (every error case including secret names), Terraform output (SG directionality, ALB ingress, internal protection, DB isolation, Secrets Manager, IAM policies, tags, peers), Kubernetes output (anti-affinity, topology spread, probes, HPA, NetworkPolicy, Secrets, envFrom), drift detection (forward, reverse, no-drift, structural changes including secrets), cost estimation, and CLI end-to-end.
 
 ## Project Structure
 
@@ -384,7 +435,7 @@ infra-gen/
     drift.py              # Bidirectional drift detector
     cost.py               # AWS cost estimator
   tests/
-    test_all.py           # 49 comprehensive tests
+    test_all.py           # 118 comprehensive tests
   docs/                   # MkDocs documentation source
     index.md
     getting-started/

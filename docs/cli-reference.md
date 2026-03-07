@@ -34,7 +34,8 @@ Validate the manifest and exit without generating any files.
 3. `cpu` matches regex `^[0-9]+m$`
 4. `replicas` > 0 in every environment
 5. `prod` replicas >= `staging` replicas >= `dev` replicas
-6. No circular dependencies (3+ services)
+6. Secret names match `^[A-Z][A-Z0-9_]*$` (no duplicates)
+7. No circular dependencies (3+ services)
 
 **Exit codes:** `0` = valid, `1` = errors found.
 

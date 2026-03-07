@@ -104,6 +104,32 @@ Every service gets a VPC security group with exact directional rules.
   security group on port 6379 (Redis) or 11211 (Memcached).
 - **ElastiCache cluster** (`cache.t3.micro`): single-node cluster.
 
+### Secrets Manager Resources (when `secrets` is non-empty)
+
+For each secret declared on a service:
+
+- **`aws_secretsmanager_secret`**: named `<service>/<env>/<SECRET_NAME>`.
+- **`aws_secretsmanager_secret_version`**: initial version with placeholder
+  value `CHANGE_ME`.
+
+Plus one IAM policy per service:
+
+- **`aws_iam_policy`**: grants `secretsmanager:GetSecretValue` and
+  `secretsmanager:DescribeSecret`, scoped to exactly that service's secret ARNs.
+
+!!! warning "Replace placeholders before applying"
+    Secret versions are created with the value `CHANGE_ME`.  Use the AWS CLI
+    or console to set real values before deploying workloads:
+
+    ```bash
+    aws secretsmanager put-secret-value \
+      --secret-id "auth-service/prod/DB_PASSWORD" \
+      --secret-string "real-password-here" \
+      --region us-east-1
+    ```
+
+See [Secrets Vault](secrets.md) for the full setup workflow.
+
 ### ECS Service
 
 An ECS service with `desired_count` from the environment's `replicas` override.

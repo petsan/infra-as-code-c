@@ -10,6 +10,9 @@ services:
     cache: redis
     exposure: external
     health_check_path: /healthz
+    secrets:
+      - JWT_SECRET
+      - RATE_LIMIT_KEY
     env_overrides:
       dev:
         replicas: 1
@@ -29,6 +32,9 @@ services:
     cache: redis
     exposure: internal
     health_check_path: /health
+    secrets:
+      - DB_PASSWORD
+      - OAUTH_CLIENT_SECRET
     env_overrides:
       dev:
         replicas: 1

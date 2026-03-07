@@ -1,6 +1,6 @@
 .\" Manpage for infra-gen
 .\" Contact: https://github.com/your-org/infra-gen/issues
-.TH INFRA-GEN 1 "2026-03-07" "infra-gen 1.0.0" "User Commands"
+.TH INFRA-GEN 1 "2026-03-07" "infra-gen 0.1.1" "User Commands"
 .SH NAME
 infra-gen \- generate multi-environment infrastructure-as-code from YAML manifests
 .SH SYNOPSIS
@@ -89,6 +89,12 @@ get public ingress.  Default: \fBinternal\fR.
 Optional HTTP path for Kubernetes readiness probes (e.g. \fB/healthz\fR).
 When omitted, a TCP socket probe is used instead.
 .TP
+.B secrets
+List of secret names required at runtime (e.g. \fBDB_PASSWORD\fR, \fBAPI_KEY\fR).
+Names must match \fB^[A-Z][A-Z0-9_]*$\fR.  Provisioned in AWS Secrets Manager
+(Terraform) and mounted as Kubernetes Secrets with \fBenvFrom\fR injection.
+Default: empty list.
+.TP
 .B env_overrides
 Per-environment settings.  Must include \fBdev\fR, \fBstaging\fR, and
 \fBprod\fR keys, each with:
@@ -131,6 +137,7 @@ the following on-demand prices (us-east-1):
   t3.micro       $7.49/mo   (one per replica)
   db.t3.micro    $12.25/mo  (one per service with db_type != none)
   cache.t3.micro $11.52/mo  (one per service with cache != none)
+  secret         $0.40/mo   (one per secret declared in secrets)
 .fi
 .SH EXIT STATUS
 .TP
@@ -173,10 +180,12 @@ S3 + DynamoDB state backend per environment.
 AWS provider configuration with default tags.
 .TP
 .I <output>/terraform/<env>/<service>.tf.json
-Per-service Terraform resources (security groups, RDS, ElastiCache, ECS).
+Per-service Terraform resources (security groups, RDS, ElastiCache, ECS,
+Secrets Manager).
 .TP
 .I <output>/kubernetes/<env>/<service>.yaml
-Multi-document YAML containing Deployment, Service, NetworkPolicy, and HPA.
+Multi-document YAML containing Deployment, Service, NetworkPolicy, HPA, and
+optionally Secret.
 .SH SEE ALSO
 .BR terraform (1),
 .BR kubectl (1),

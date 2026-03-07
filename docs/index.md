@@ -17,7 +17,8 @@ infra-gen reads a declarative service manifest and produces:
 | **Cycle detection** | Finds *all* circular dependencies (3+ services), not just the first |
 | **Drift detection** | Bidirectional: forward (pending changes) and reverse (orphaned resources) |
 | **Cost estimation** | Estimated monthly AWS costs using t3.micro / db.t3.micro / cache.t3.micro pricing |
-| **Validation** | Dependency checks, CPU format, replica ordering, self-reference detection |
+| **Secrets vault** | AWS Secrets Manager + Kubernetes Secrets with IAM policies and envFrom injection |
+| **Validation** | Dependency checks, CPU format, replica ordering, secret names, self-reference detection |
 
 ## Quick Example
 
@@ -59,7 +60,7 @@ infra_gen/
     drift.py          # Bidirectional drift detector
     cost.py           # AWS cost estimator
 tests/
-    test_all.py       # 49 comprehensive tests
+    test_all.py       # 118 comprehensive tests
 docs/                 # This documentation (MkDocs + Material)
 man/
     infra-gen.1       # Unix man page
@@ -72,4 +73,5 @@ sample_with_cycle.yaml # Example with a deliberate 3-service cycle
 - [Installation](getting-started/installation.md) -- install from source or pip
 - [Quick Start](getting-started/quickstart.md) -- generate your first infrastructure
 - [Manifest Format](guide/manifest.md) -- full field reference
+- [Secrets Vault](guide/secrets.md) -- setup and usage
 - [CLI Reference](cli-reference.md) -- every flag and option
