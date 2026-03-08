@@ -2893,3 +2893,328 @@ class TestKubernetesHPADetails:
         hpa = next(d for d in docs if d["kind"] == "HorizontalPodAutoscaler")
         assert hpa["spec"]["minReplicas"] == 1
         assert hpa["spec"]["maxReplicas"] == 3  # max(1*3, 3)
+
+
+# ---- Item 1: ElastiCache subnet_group_name ----
+
+
+class TestElastiCacheSubnetGroup:
+    def test_elasticache_has_subnet_group_name(self, tmpdir):
+        """ElastiCache cluster references the subnet group variable."""
+        manifest = Manifest(services=[_svc("web", cache="redis")])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        cache = tf["resource"]["aws_elasticache_cluster"]["web"]
+        assert cache["subnet_group_name"] == "${var.elasticache_subnet_group_name}"
+
+    def test_variables_include_elasticache_subnet(self, tmpdir):
+        """variables.tf.json includes elasticache_subnet_group_name."""
+        manifest = Manifest(services=[_svc("web")])
+        generate_terraform(manifest, tmpdir)
+        path = Path(tmpdir) / "terraform" / "prod" / "variables.tf.json"
+        content = json.loads(path.read_text())
+        assert "elasticache_subnet_group_name" in content["variable"]
+
+
+# ---- Item 2: ElastiCache cluster_id length validation ----
+
+
+class TestClusterIdLength:
+    def test_short_name_no_warning(self):
+        """Short service name + env fits within 20 chars."""
+        svc = _svc("web", cache="redis")
+        errors = validate_manifest(Manifest(services=[svc]))
+        assert not any("cluster_id" in e.message for e in errors)
+
+    def test_long_name_triggers_info(self):
+        """Long service name causes cluster_id > 20 chars info warning."""
+        svc = _svc("very-long-svc-name", cache="redis")
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info" and "cluster_id" in e.message]
+        assert len(info) >= 1
+        assert "truncated" in info[0].message
+
+    def test_cluster_id_truncated_in_tf(self, tmpdir):
+        """Terraform truncates cluster_id to 20 chars."""
+        svc = _svc("very-long-svc-name", cache="redis")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads(
+            (Path(tmpdir) / "terraform" / "prod" / "very-long-svc-name.tf.json").read_text()
+        )
+        cache = tf["resource"]["aws_elasticache_cluster"]["very_long_svc_name"]
+        assert len(cache["cluster_id"]) <= 20
+
+
+# ---- Item 3: Non-numeric port handling ----
+
+
+class TestParserPortValidation:
+    def test_non_numeric_port_raises_valueerror(self, tmpdir):
+        """Parser raises ValueError for non-numeric port."""
+        path = Path(tmpdir) / "bad.yaml"
+        path.write_text(
+            "services:\n"
+            "  - name: web\n"
+            "    port: abc\n"
+            "    env_overrides:\n"
+            "      dev: {replicas: 1, cpu: '250m'}\n"
+            "      staging: {replicas: 2, cpu: '500m'}\n"
+            "      prod: {replicas: 3, cpu: '750m'}\n"
+        )
+        with pytest.raises(ValueError, match="port must be an integer"):
+            parse_manifest(str(path))
+
+    def test_numeric_string_port_works(self, tmpdir):
+        """Port given as string '8080' is parsed as int."""
+        path = Path(tmpdir) / "good.yaml"
+        path.write_text(
+            "services:\n"
+            "  - name: web\n"
+            "    port: '8080'\n"
+            "    env_overrides:\n"
+            "      dev: {replicas: 1, cpu: '250m'}\n"
+            "      staging: {replicas: 2, cpu: '500m'}\n"
+            "      prod: {replicas: 3, cpu: '750m'}\n"
+        )
+        manifest = parse_manifest(str(path))
+        assert manifest.services[0].port == 8080
+
+
+# ---- Item 4: CPU regex help text ----
+
+
+class TestCPURegexMessage:
+    def test_validator_error_message_correct_regex(self):
+        """Validator error message uses correct regex ^[1-9][0-9]*m$."""
+        svc = _svc("a")
+        svc.env_overrides["dev"] = EnvOverride(replicas=1, cpu="0m")
+        errors = validate_manifest(Manifest(services=[svc]))
+        cpu_errors = [e for e in errors if "cpu must match" in e.message]
+        assert len(cpu_errors) >= 1
+        assert "^[1-9][0-9]*m$" in cpu_errors[0].message
+
+    def test_zero_cpu_rejected(self):
+        """0m CPU is rejected by the validator."""
+        svc = _svc("a")
+        svc.env_overrides["dev"] = EnvOverride(replicas=1, cpu="0m")
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert any("cpu must match" in e.message for e in real_errors)
+
+
+# ---- Item 5: Cost grand total precision ----
+
+
+class TestCostGrandTotal:
+    def test_grand_total_from_raw_costs(self):
+        """Grand total is calculated from raw costs, not rounded subtotals."""
+        costs = format_cost_report(estimate_costs(Manifest(services=[_svc("a")])))
+        assert "GRAND TOTAL" in costs
+
+    def test_grand_total_matches_subtotals(self):
+        """Grand total matches sum of per-service costs across all envs."""
+        manifest = Manifest(services=[_svc("a", db="postgres", cache="redis")])
+        costs = estimate_costs(manifest)
+        report = format_cost_report(costs)
+        # Parse the grand total from the report
+        import re
+
+        match = re.search(r"GRAND TOTAL\s+\$\s*([\d.]+)/mo", report)
+        assert match is not None
+        grand = float(match.group(1))
+        # Sum raw per-service costs across envs
+        raw_total = 0.0
+        for env in ["dev", "staging", "prod"]:
+            for name, val in costs[env].items():
+                if name != "total":
+                    raw_total += val
+        assert abs(grand - round(raw_total, 2)) < 0.01
+
+
+# ---- Item 6: DB_PASSWORD collision ----
+
+
+class TestDBPasswordCollision:
+    def test_db_password_collision_detected(self):
+        """User secret 'DB_PASSWORD' + db_type != 'none' is an error."""
+        svc = _svc("web", db="postgres")
+        svc.secrets = ["DB_PASSWORD"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert any("collides with auto-generated" in e.message for e in real_errors)
+
+    def test_db_password_no_collision_without_db(self):
+        """DB_PASSWORD is fine when db_type='none'."""
+        svc = _svc("web")
+        svc.secrets = ["DB_PASSWORD"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert not any("collides" in e.message for e in real_errors)
+
+    def test_other_secret_no_collision_with_db(self):
+        """Non-DB_PASSWORD secrets don't trigger collision."""
+        svc = _svc("web", db="postgres")
+        svc.secrets = ["API_KEY"]
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert not any("collides" in e.message for e in real_errors)
+
+
+# ---- Item 8: Unknown YAML field warnings ----
+
+
+class TestUnknownYAMLFields:
+    def test_unknown_top_level_key_warns(self, tmpdir, capsys):
+        """Unknown top-level key triggers a warning to stderr."""
+        path = Path(tmpdir) / "test.yaml"
+        path.write_text(
+            "services:\n"
+            "  - name: web\n"
+            "    port: 8080\n"
+            "    env_overrides:\n"
+            "      dev: {replicas: 1, cpu: '250m'}\n"
+            "      staging: {replicas: 2, cpu: '500m'}\n"
+            "      prod: {replicas: 3, cpu: '750m'}\n"
+            "unknown_key: true\n"
+        )
+        parse_manifest(str(path))
+        captured = capsys.readouterr()
+        assert "unknown top-level key 'unknown_key'" in captured.err
+
+    def test_unknown_service_key_warns(self, tmpdir, capsys):
+        """Unknown service key triggers a warning to stderr."""
+        path = Path(tmpdir) / "test.yaml"
+        path.write_text(
+            "services:\n"
+            "  - name: web\n"
+            "    port: 8080\n"
+            "    typo_field: something\n"
+            "    env_overrides:\n"
+            "      dev: {replicas: 1, cpu: '250m'}\n"
+            "      staging: {replicas: 2, cpu: '500m'}\n"
+            "      prod: {replicas: 3, cpu: '750m'}\n"
+        )
+        parse_manifest(str(path))
+        captured = capsys.readouterr()
+        assert "unknown key 'typo_field'" in captured.err
+
+    def test_known_keys_no_warning(self, tmpdir, capsys):
+        """Valid keys don't trigger warnings."""
+        path = Path(tmpdir) / "test.yaml"
+        path.write_text(
+            "services:\n"
+            "  - name: web\n"
+            "    port: 8080\n"
+            "    db_type: none\n"
+            "    cache: none\n"
+            "    exposure: internal\n"
+            "    env_overrides:\n"
+            "      dev: {replicas: 1, cpu: '250m'}\n"
+            "      staging: {replicas: 2, cpu: '500m'}\n"
+            "      prod: {replicas: 3, cpu: '750m'}\n"
+            "regions:\n"
+            "  - us-east-1\n"
+        )
+        parse_manifest(str(path))
+        captured = capsys.readouterr()
+        assert "unknown" not in captured.err
+
+
+# ---- Item 9: CPU cap warning ----
+
+
+class TestCPUCapWarning:
+    def test_cpu_exceeding_4096_warns(self):
+        """CPU > 4096m triggers an info warning."""
+        svc = Service(
+            name="big",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="8000m"),
+                "staging": EnvOverride(replicas=1, cpu="8000m"),
+                "prod": EnvOverride(replicas=1, cpu="8000m"),
+            },
+        )
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info" and "capped at 4096" in e.message]
+        assert len(info) >= 1
+
+    def test_cpu_at_4096_no_warning(self):
+        """CPU exactly at 4096m does not trigger a warning."""
+        svc = Service(
+            name="big",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="4096m"),
+                "staging": EnvOverride(replicas=1, cpu="4096m"),
+                "prod": EnvOverride(replicas=1, cpu="4096m"),
+            },
+        )
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info" and "capped" in e.message]
+        assert len(info) == 0
+
+
+# ---- Item 10: Iterative DFS cycle detection ----
+
+
+class TestIterativeDFS:
+    def test_cycle_detection_still_works(self):
+        """Iterative DFS correctly detects 3-node cycles."""
+        manifest = Manifest(
+            services=[
+                _svc("a", deps=["b"]),
+                _svc("b", deps=["c"]),
+                _svc("c", deps=["a"]),
+            ]
+        )
+        cycles = find_all_cycles(manifest)
+        cycle_sets = [set(c) for c in cycles]
+        assert any({"a", "b", "c"} == cs for cs in cycle_sets)
+
+    def test_peer_pairs_still_excluded(self):
+        """Iterative DFS still excludes peer pairs from cycles."""
+        manifest = Manifest(
+            services=[
+                _svc("x", deps=["y"]),
+                _svc("y", deps=["x"]),
+            ]
+        )
+        cycles = find_all_cycles(manifest)
+        assert len(cycles) == 0
+
+    def test_many_services_no_recursion_error(self):
+        """100+ services with a chain don't cause recursion errors."""
+        n = 150
+        services = []
+        for i in range(n):
+            deps = [f"svc-{i + 1}"] if i < n - 1 else []
+            services.append(_svc(f"svc-{i}", deps=deps))
+        manifest = Manifest(services=services)
+        # Should not raise RecursionError
+        cycles = find_all_cycles(manifest)
+        assert len(cycles) == 0
+
+    def test_large_cycle_detected(self):
+        """Cycle involving many services is detected."""
+        # 5-node cycle
+        services = [
+            _svc("c0", deps=["c1"]),
+            _svc("c1", deps=["c2"]),
+            _svc("c2", deps=["c3"]),
+            _svc("c3", deps=["c4"]),
+            _svc("c4", deps=["c0"]),
+        ]
+        manifest = Manifest(services=services)
+        cycles = find_all_cycles(manifest)
+        cycle_sets = [set(c) for c in cycles]
+        assert any({"c0", "c1", "c2", "c3", "c4"} == cs for cs in cycle_sets)

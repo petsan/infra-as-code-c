@@ -81,7 +81,7 @@ _EPILOG = textwrap.dedent("""\
     validation rules (--validate):
       - All dependency names must reference existing services
       - No self-references in dependencies
-      - cpu must match ^[0-9]+m$ (Kubernetes millicore format)
+      - cpu must match ^[1-9][0-9]*m$ (Kubernetes millicore format, no leading zeros)
       - replicas must be > 0 in every environment
       - prod replicas >= staging replicas >= dev replicas
       - True cycles (3+ services) are errors
@@ -190,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.4",
+        version="%(prog)s 0.2.0",
     )
 
     args = parser.parse_args(argv)

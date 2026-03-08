@@ -113,11 +113,11 @@ def format_cost_report(costs: dict[str, dict[str, float]]) -> str:
     """
     lines = ["=== Estimated Monthly AWS Costs ===", ""]
 
-    grand_total = 0.0
+    grand_total_raw = 0.0
     for env in ENVIRONMENTS:
         env_costs = costs[env]
         total = env_costs["total"]
-        grand_total += total
+        grand_total_raw += sum(v for k, v in env_costs.items() if k != "total")
         lines.append(f"  {env.upper()}:")
 
         for name, cost in sorted(env_costs.items()):
@@ -129,5 +129,5 @@ def format_cost_report(costs: dict[str, dict[str, float]]) -> str:
         lines.append(f"    {'Subtotal':30s} ${total:>8.2f}/mo")
         lines.append("")
 
-    lines.append(f"  {'GRAND TOTAL':32s} ${grand_total:>8.2f}/mo")
+    lines.append(f"  {'GRAND TOTAL':32s} ${round(grand_total_raw, 2):>8.2f}/mo")
     return "\n".join(lines)

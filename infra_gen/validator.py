@@ -173,7 +173,7 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
                 errors.append(
                     ValidationError(
                         f"Service '{svc.name}' env '{env_name}': "
-                        f"cpu must match ^[0-9]+m$, got '{ov.cpu}'"
+                        f"cpu must match ^[1-9][0-9]*m$, got '{ov.cpu}'"
                     )
                 )
 
@@ -189,6 +189,30 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
         if len(svc.secrets) != len(set(svc.secrets)):
             errors.append(ValidationError(f"Service '{svc.name}': duplicate secret names"))
 
+        # DB_PASSWORD collision: user-declared secret collides with auto-generated DB secret
+        if svc.has_db and "DB_PASSWORD" in svc.secrets:
+            errors.append(
+                ValidationError(
+                    f"Service '{svc.name}': secret 'DB_PASSWORD' collides with "
+                    f"auto-generated database password (db_type='{svc.db_type}')"
+                )
+            )
+
+        # ElastiCache cluster_id max 20 characters (will be truncated)
+        if svc.has_cache:
+            for env_name in required_envs:
+                cluster_id = f"{svc.name}-{env_name}"
+                if len(cluster_id) > 20:
+                    errors.append(
+                        ValidationError(
+                            f"Service '{svc.name}': ElastiCache cluster_id "
+                            f"'{cluster_id}' exceeds 20-character limit "
+                            f"({len(cluster_id)} chars, will be truncated)",
+                            severity="info",
+                        )
+                    )
+                    break  # One warning is enough
+
         # Replica ordering: prod >= staging >= dev
         if all(env in svc.env_overrides for env in required_envs):
             dev_r = svc.env_overrides["dev"].replicas
@@ -202,6 +226,21 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
                         f"prod({prod_r}) >= staging({staging_r}) >= dev({dev_r}) required"
                     )
                 )
+
+    # CPU cap warning: millicore values > 4096 silently cap at Fargate max
+    for svc in manifest.services:
+        for env_name, ov in svc.env_overrides.items():
+            if cpu_regex.match(ov.cpu):
+                millicore = int(ov.cpu.rstrip("m"))
+                if millicore > 4096:
+                    errors.append(
+                        ValidationError(
+                            f"Service '{svc.name}' env '{env_name}': "
+                            f"cpu '{ov.cpu}' exceeds Fargate maximum (4096m), "
+                            f"will be capped at 4096",
+                            severity="info",
+                        )
+                    )
 
     # Cycle detection (3+ services only, peer pairs excluded)
     cycles = find_all_cycles(manifest)

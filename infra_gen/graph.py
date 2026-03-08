@@ -98,22 +98,28 @@ def find_all_cycles(manifest: Manifest) -> list[list[str]]:
 
     nodes = sorted(svc_map.keys())
     cycles: list[list[str]] = []
+    max_depth = min(len(nodes), 100)
 
-    def _dfs(start: str, current: str, path: list[str], visited: set[str]) -> None:
-        """Recursive DFS that records elementary circuits back to *start*."""
-        for neighbor in adj.get(current, []):
+    for start in nodes:
+        # Iterative DFS using an explicit stack.
+        # Each stack frame: (current_node, path, visited, neighbor_index)
+        stack: list[tuple[str, list[str], set[str], int]] = [(start, [start], {start}, 0)]
+        while stack:
+            current, path, visited, ni = stack[-1]
+            neighbors = adj.get(current, [])
+            if ni >= len(neighbors):
+                stack.pop()
+                continue
+            # Advance the neighbor index for the current frame
+            stack[-1] = (current, path, visited, ni + 1)
+            neighbor = neighbors[ni]
+
             if neighbor == start and len(path) >= 3:
                 cycles.append(list(path))
-            elif neighbor not in visited and neighbor >= start:
-                visited.add(neighbor)
-                path.append(neighbor)
-                _dfs(start, neighbor, path, visited)
-                path.pop()
-                visited.remove(neighbor)
-
-    for node in nodes:
-        visited = {node}
-        _dfs(node, node, [node], visited)
+            elif neighbor not in visited and neighbor >= start and len(path) < max_depth:
+                new_visited = visited | {neighbor}
+                new_path = [*path, neighbor]
+                stack.append((neighbor, new_path, new_visited, 0))
 
     return cycles
 

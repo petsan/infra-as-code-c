@@ -32,11 +32,25 @@ Missing optional keys fall back to safe defaults (``"none"`` for db/cache,
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import yaml
 
 from .models import EnvOverride, Manifest, Service
+
+_KNOWN_SERVICE_KEYS = {
+    "name",
+    "port",
+    "dependencies",
+    "db_type",
+    "cache",
+    "exposure",
+    "health_check_path",
+    "env_overrides",
+    "secrets",
+}
+_KNOWN_TOP_LEVEL_KEYS = {"services", "regions"}
 
 
 def parse_manifest(path: str | Path) -> Manifest:
@@ -61,8 +75,21 @@ def parse_manifest(path: str | Path) -> Manifest:
     if data is None:
         data = {}
 
+    # Warn on unknown top-level keys
+    for key in data:
+        if key not in _KNOWN_TOP_LEVEL_KEYS:
+            print(f"Warning: unknown top-level key '{key}' in manifest", file=sys.stderr)
+
     services = []
     for svc in data.get("services", []):
+        # Warn on unknown service-level keys
+        for key in svc:
+            if key not in _KNOWN_SERVICE_KEYS:
+                print(
+                    f"Warning: unknown key '{key}' in service '{svc.get('name', '?')}'",
+                    file=sys.stderr,
+                )
+
         env_overrides = {}
         for env_name, ov in svc.get("env_overrides", {}).items():
             env_overrides[env_name] = EnvOverride(
@@ -82,10 +109,17 @@ def parse_manifest(path: str | Path) -> Manifest:
                 f"Service '{svc['name']}': secrets must be a list, got {type(secrets).__name__}"
             )
 
+        try:
+            port = int(svc["port"])
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Service '{svc['name']}': port must be an integer, got '{svc['port']}'"
+            ) from e
+
         services.append(
             Service(
                 name=svc["name"],
-                port=int(svc["port"]),
+                port=port,
                 dependencies=deps,
                 db_type=svc.get("db_type", "none"),
                 cache=svc.get("cache", "none"),

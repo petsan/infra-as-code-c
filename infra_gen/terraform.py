@@ -191,6 +191,10 @@ def _write_variables(env_dir: Path) -> str:
                 "description": "Name of the DB subnet group for RDS instances",
                 "type": "string",
             },
+            "elasticache_subnet_group_name": {
+                "description": "Name of the ElastiCache subnet group",
+                "type": "string",
+            },
         }
     }
     return _write_json(env_dir / "variables.tf.json", content)
@@ -304,6 +308,10 @@ def _build_security_groups(
                 }
             )
 
+    # NOTE: Inline ingress/egress rules are used intentionally here rather than
+    # separate aws_security_group_rule resources.  This keeps each service's
+    # security posture in a single, self-contained .tf.json file, simplifying
+    # drift detection and per-service file generation.
     _add(
         resources,
         "aws_security_group",
@@ -438,11 +446,12 @@ def _build_cache(
         "aws_elasticache_cluster",
         tf,
         {
-            "cluster_id": f"{svc.name}-{env}",
+            "cluster_id": f"{svc.name}-{env}"[:20],
             "engine": svc.cache,
             "node_type": "cache.t3.micro",
             "port": cache_port,
             "num_cache_nodes": 1,
+            "subnet_group_name": "${var.elasticache_subnet_group_name}",
             "security_group_ids": [f"${{aws_security_group.{tf}_cache.id}}"],
             "tags": cache_tags,
         },

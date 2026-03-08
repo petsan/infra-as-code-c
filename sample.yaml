@@ -33,7 +33,7 @@ services:
     exposure: internal
     health_check_path: /health
     secrets:
-      - DB_PASSWORD
+      - AUTH_DB_SECRET
       - OAUTH_CLIENT_SECRET
     env_overrides:
       dev:
