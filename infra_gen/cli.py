@@ -190,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.3",
+        version="%(prog)s 0.1.4",
     )
 
     args = parser.parse_args(argv)
@@ -375,8 +375,12 @@ def _handle_generate(manifest: Manifest, output_dir: str) -> int:
             print(err)
 
     # Generate
-    tf_files = generate_terraform(manifest, output_dir)
-    k8s_files = generate_kubernetes(manifest, output_dir)
+    try:
+        tf_files = generate_terraform(manifest, output_dir)
+        k8s_files = generate_kubernetes(manifest, output_dir)
+    except OSError as e:
+        print(f"Error writing output files: {e}", file=sys.stderr)
+        return 1
 
     print(f"\nGenerated {len(tf_files)} Terraform files")
     print(f"Generated {len(k8s_files)} Kubernetes manifests")

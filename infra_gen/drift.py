@@ -124,9 +124,21 @@ def _detect_terraform_drift(
                 )
             else:
                 assert tf_env_dir is not None
-                existing: dict[str, Any] = json.loads(
-                    (tf_env_dir / f"{svc_name}.tf.json").read_text()
-                )
+                try:
+                    existing: dict[str, Any] = json.loads(
+                        (tf_env_dir / f"{svc_name}.tf.json").read_text()
+                    )
+                except (json.JSONDecodeError, OSError):
+                    report["forward"].append(
+                        {
+                            "type": "terraform",
+                            "environment": env,
+                            "service": svc_name,
+                            "action": "update",
+                            "reason": "Existing file is malformed, will be regenerated",
+                        }
+                    )
+                    continue
                 svc = next(s for s in manifest.services if s.name == svc_name)
                 existing_resources = set(existing.get("resource", {}).keys())
                 has_db_resource = any("db_instance" in k for k in existing_resources)

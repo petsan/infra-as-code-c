@@ -190,7 +190,6 @@ def _write_variables(env_dir: Path) -> str:
             "db_subnet_group_name": {
                 "description": "Name of the DB subnet group for RDS instances",
                 "type": "string",
-                "default": "",
             },
         }
     }
@@ -369,6 +368,7 @@ def _build_database(
             "username": "admin",
             "password": f"${{aws_secretsmanager_secret_version.{tf}_db_password.secret_string}}",
             "skip_final_snapshot": env != "prod",
+            **({"final_snapshot_identifier": f"{svc.name}-{env}-final"} if env == "prod" else {}),
             "db_subnet_group_name": "${var.db_subnet_group_name}",
             "vpc_security_group_ids": [f"${{aws_security_group.{tf}_db.id}}"],
             "tags": db_tags,
@@ -441,6 +441,7 @@ def _build_cache(
             "cluster_id": f"{svc.name}-{env}",
             "engine": svc.cache,
             "node_type": "cache.t3.micro",
+            "port": cache_port,
             "num_cache_nodes": 1,
             "security_group_ids": [f"${{aws_security_group.{tf}_cache.id}}"],
             "tags": cache_tags,

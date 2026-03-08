@@ -70,19 +70,33 @@ def parse_manifest(path: str | Path) -> Manifest:
                 cpu=ov["cpu"],
             )
 
+        deps = svc.get("dependencies", [])
+        if not isinstance(deps, list):
+            raise TypeError(
+                f"Service '{svc['name']}': dependencies must be a list, got {type(deps).__name__}"
+            )
+
+        secrets = svc.get("secrets", [])
+        if not isinstance(secrets, list):
+            raise TypeError(
+                f"Service '{svc['name']}': secrets must be a list, got {type(secrets).__name__}"
+            )
+
         services.append(
             Service(
                 name=svc["name"],
-                port=svc["port"],
-                dependencies=svc.get("dependencies", []),
+                port=int(svc["port"]),
+                dependencies=deps,
                 db_type=svc.get("db_type", "none"),
                 cache=svc.get("cache", "none"),
                 exposure=svc.get("exposure", "internal"),
                 health_check_path=svc.get("health_check_path"),
                 env_overrides=env_overrides,
-                secrets=svc.get("secrets", []),
+                secrets=secrets,
             )
         )
 
     regions = data.get("regions", ["us-east-1"])
+    if not isinstance(regions, list):
+        raise TypeError(f"regions must be a list, got {type(regions).__name__}")
     return Manifest(services=services, regions=regions)

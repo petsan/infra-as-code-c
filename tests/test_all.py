@@ -2201,3 +2201,695 @@ class TestDBSubnetGroupName:
         tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
         db = tf["resource"]["aws_db_instance"]["api"]
         assert db["db_subnet_group_name"] == "${var.db_subnet_group_name}"
+
+    def test_db_subnet_group_no_default(self, simple_manifest, tmpdir):
+        """db_subnet_group_name variable has no default (must be provided)."""
+        generate_terraform(simple_manifest, tmpdir)
+        path = Path(tmpdir) / "terraform" / "prod" / "variables.tf.json"
+        content = json.loads(path.read_text())
+        assert "default" not in content["variable"]["db_subnet_group_name"]
+
+
+# ---- Production readiness fixes: Terraform correctness ----
+
+
+class TestFinalSnapshotIdentifier:
+    """Tests for RDS final_snapshot_identifier in prod."""
+
+    def test_prod_has_final_snapshot_identifier(self, tmpdir):
+        """Prod RDS instances have final_snapshot_identifier."""
+        svc = _svc("api", db="postgres")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        db = tf["resource"]["aws_db_instance"]["api"]
+        assert db["skip_final_snapshot"] is False
+        assert db["final_snapshot_identifier"] == "api-prod-final"
+
+    def test_dev_no_final_snapshot_identifier(self, tmpdir):
+        """Dev RDS instances skip final snapshot (no identifier needed)."""
+        svc = _svc("api", db="postgres")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "dev" / "api.tf.json").read_text())
+        db = tf["resource"]["aws_db_instance"]["api"]
+        assert db["skip_final_snapshot"] is True
+        assert "final_snapshot_identifier" not in db
+
+    def test_staging_no_final_snapshot_identifier(self, tmpdir):
+        """Staging RDS instances skip final snapshot."""
+        svc = _svc("api", db="postgres")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "staging" / "api.tf.json").read_text())
+        db = tf["resource"]["aws_db_instance"]["api"]
+        assert db["skip_final_snapshot"] is True
+        assert "final_snapshot_identifier" not in db
+
+
+class TestElastiCachePort:
+    """Tests for ElastiCache port field."""
+
+    def test_redis_cache_has_port_6379(self, tmpdir):
+        """Redis ElastiCache cluster has port 6379."""
+        svc = _svc("api", cache="redis")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        cache = tf["resource"]["aws_elasticache_cluster"]["api"]
+        assert cache["port"] == 6379
+
+    def test_memcached_cache_has_port_11211(self, tmpdir):
+        """Memcached ElastiCache cluster has port 11211."""
+        svc = _svc("api", cache="memcached")
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "api.tf.json").read_text())
+        cache = tf["resource"]["aws_elasticache_cluster"]["api"]
+        assert cache["port"] == 11211
+
+
+# ---- Production readiness fixes: Validation ----
+
+
+class TestDuplicateServiceNames:
+    """Tests for duplicate service name detection."""
+
+    def test_duplicate_names_detected(self):
+        """Duplicate service names produce validation error."""
+        svc1 = _svc("api")
+        svc2 = _svc("api")
+        manifest = Manifest(services=[svc1, svc2])
+        errors = validate_manifest(manifest)
+        dupes = [e for e in errors if "Duplicate service name" in e.message]
+        assert len(dupes) == 1
+
+    def test_unique_names_pass(self):
+        """Unique service names do not produce duplicate error."""
+        manifest = Manifest(services=[_svc("api"), _svc("auth")])
+        errors = validate_manifest(manifest)
+        dupes = [e for e in errors if "Duplicate service name" in e.message]
+        assert len(dupes) == 0
+
+
+class TestPortValidation:
+    """Tests for port range validation."""
+
+    def test_valid_port(self):
+        """Valid port passes validation."""
+        svc = _svc("api")
+        svc.port = 8080
+        errors = validate_manifest(Manifest(services=[svc]))
+        port_errors = [e for e in errors if "port" in e.message]
+        assert len(port_errors) == 0
+
+    def test_port_zero_fails(self):
+        """Port 0 fails validation."""
+        svc = _svc("api")
+        svc.port = 0
+        errors = validate_manifest(Manifest(services=[svc]))
+        port_errors = [e for e in errors if "port" in e.message]
+        assert len(port_errors) == 1
+
+    def test_port_negative_fails(self):
+        """Negative port fails validation."""
+        svc = _svc("api")
+        svc.port = -1
+        errors = validate_manifest(Manifest(services=[svc]))
+        port_errors = [e for e in errors if "port" in e.message]
+        assert len(port_errors) == 1
+
+    def test_port_too_high_fails(self):
+        """Port above 65535 fails validation."""
+        svc = _svc("api")
+        svc.port = 70000
+        errors = validate_manifest(Manifest(services=[svc]))
+        port_errors = [e for e in errors if "port" in e.message]
+        assert len(port_errors) == 1
+
+    def test_port_65535_valid(self):
+        """Port 65535 (max) passes validation."""
+        svc = _svc("api")
+        svc.port = 65535
+        errors = validate_manifest(Manifest(services=[svc]))
+        port_errors = [e for e in errors if "port" in e.message]
+        assert len(port_errors) == 0
+
+    def test_port_1_valid(self):
+        """Port 1 (min) passes validation."""
+        svc = _svc("api")
+        svc.port = 1
+        errors = validate_manifest(Manifest(services=[svc]))
+        port_errors = [e for e in errors if "port" in e.message]
+        assert len(port_errors) == 0
+
+
+class TestEnumValidation:
+    """Tests for db_type, cache, and exposure enum validation."""
+
+    def test_invalid_db_type(self):
+        """Invalid db_type fails validation."""
+        svc = _svc("api", db="postgresql")
+        errors = validate_manifest(Manifest(services=[svc]))
+        db_errors = [e for e in errors if "invalid db_type" in e.message]
+        assert len(db_errors) == 1
+
+    def test_valid_db_types(self):
+        """All valid db_types pass validation."""
+        for db in ["postgres", "mysql", "none"]:
+            svc = _svc("api", db=db)
+            errors = validate_manifest(Manifest(services=[svc]))
+            db_errors = [e for e in errors if "invalid db_type" in e.message]
+            assert len(db_errors) == 0, f"db_type '{db}' should be valid"
+
+    def test_invalid_cache(self):
+        """Invalid cache type fails validation."""
+        svc = _svc("api", cache="memcache")
+        errors = validate_manifest(Manifest(services=[svc]))
+        c_errors = [e for e in errors if "invalid cache" in e.message]
+        assert len(c_errors) == 1
+
+    def test_valid_caches(self):
+        """All valid cache types pass validation."""
+        for cache in ["redis", "memcached", "none"]:
+            svc = _svc("api", cache=cache)
+            errors = validate_manifest(Manifest(services=[svc]))
+            c_errors = [e for e in errors if "invalid cache" in e.message]
+            assert len(c_errors) == 0, f"cache '{cache}' should be valid"
+
+    def test_invalid_exposure(self):
+        """Invalid exposure fails validation."""
+        svc = _svc("api", exposure="public")
+        errors = validate_manifest(Manifest(services=[svc]))
+        exp_errors = [e for e in errors if "invalid exposure" in e.message]
+        assert len(exp_errors) == 1
+
+    def test_valid_exposures(self):
+        """All valid exposure values pass validation."""
+        for exp in ["internal", "external"]:
+            svc = _svc("api", exposure=exp)
+            errors = validate_manifest(Manifest(services=[svc]))
+            exp_errors = [e for e in errors if "invalid exposure" in e.message]
+            assert len(exp_errors) == 0, f"exposure '{exp}' should be valid"
+
+
+class TestCpuZeroRejection:
+    """Tests for 0m CPU rejection."""
+
+    def test_zero_cpu_rejected(self):
+        """CPU value of 0m is rejected by validation."""
+        svc = Service(
+            name="api",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="0m"),
+                "staging": EnvOverride(replicas=2, cpu="500m"),
+                "prod": EnvOverride(replicas=3, cpu="1000m"),
+            },
+        )
+        errors = validate_manifest(Manifest(services=[svc]))
+        cpu_errors = [e for e in errors if "cpu" in e.message]
+        assert len(cpu_errors) == 1
+
+    def test_1m_cpu_accepted(self):
+        """CPU value of 1m is accepted."""
+        svc = Service(
+            name="api",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="1m"),
+                "staging": EnvOverride(replicas=2, cpu="500m"),
+                "prod": EnvOverride(replicas=3, cpu="1000m"),
+            },
+        )
+        errors = validate_manifest(Manifest(services=[svc]))
+        cpu_errors = [e for e in errors if "cpu" in e.message]
+        assert len(cpu_errors) == 0
+
+
+# ---- Production readiness fixes: Parser type safety ----
+
+
+class TestParserTypeSafety:
+    """Tests for parser type coercion and validation."""
+
+    def test_dependencies_as_string_raises(self, tmpdir):
+        """Parser raises TypeError when dependencies is a string."""
+        data = {"services": [{"name": "api", "port": 8080, "dependencies": "auth"}]}
+        path = Path(tmpdir) / "bad.yaml"
+        path.write_text(yaml.dump(data))
+        with pytest.raises(TypeError, match="dependencies must be a list"):
+            parse_manifest(str(path))
+
+    def test_secrets_as_string_raises(self, tmpdir):
+        """Parser raises TypeError when secrets is a string."""
+        data = {"services": [{"name": "api", "port": 8080, "secrets": "DB_PASSWORD"}]}
+        path = Path(tmpdir) / "bad.yaml"
+        path.write_text(yaml.dump(data))
+        with pytest.raises(TypeError, match="secrets must be a list"):
+            parse_manifest(str(path))
+
+    def test_regions_as_string_raises(self, tmpdir):
+        """Parser raises TypeError when regions is a string."""
+        data = {
+            "services": [{"name": "api", "port": 8080}],
+            "regions": "us-east-1",
+        }
+        path = Path(tmpdir) / "bad.yaml"
+        path.write_text(yaml.dump(data))
+        with pytest.raises(TypeError, match="regions must be a list"):
+            parse_manifest(str(path))
+
+    def test_port_coerced_to_int(self, tmpdir):
+        """Parser coerces port to int."""
+        data = {"services": [{"name": "api", "port": 8080}]}
+        path = Path(tmpdir) / "m.yaml"
+        path.write_text(yaml.dump(data))
+        manifest = parse_manifest(str(path))
+        assert isinstance(manifest.services[0].port, int)
+
+
+# ---- Production readiness fixes: Drift detection robustness ----
+
+
+class TestDriftMalformedFiles:
+    """Tests for drift detection handling malformed files."""
+
+    def test_drift_with_malformed_tf_json(self, tmpdir):
+        """Drift detection handles malformed .tf.json files gracefully."""
+        svc = _svc("api")
+        manifest = Manifest(services=[svc])
+        # Generate first to create structure
+        generate_terraform(manifest, tmpdir)
+        # Corrupt a file
+        bad = Path(tmpdir) / "terraform" / "prod" / "api.tf.json"
+        bad.write_text("NOT VALID JSON {{{")
+        # Drift detection should not crash
+        report = detect_drift(manifest, tmpdir)
+        # Should report update for the malformed file
+        updates = [
+            r
+            for r in report["forward"]
+            if r["service"] == "api" and r["environment"] == "prod" and r["type"] == "terraform"
+        ]
+        assert len(updates) >= 1
+
+
+# ---- Test coverage gaps: All features combined ----
+
+
+class TestAllFeaturesCombined:
+    """Tests for service with all features enabled simultaneously."""
+
+    def _full_svc(self):
+        return Service(
+            name="mega",
+            port=9090,
+            dependencies=[],
+            db_type="postgres",
+            cache="redis",
+            exposure="external",
+            health_check_path="/healthz",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="250m"),
+                "staging": EnvOverride(replicas=2, cpu="500m"),
+                "prod": EnvOverride(replicas=4, cpu="1000m"),
+            },
+            secrets=["DB_PASSWORD", "API_KEY"],
+        )
+
+    def test_terraform_all_resource_types_present(self, tmpdir):
+        """Service with all features has all expected resource types."""
+        manifest = Manifest(services=[self._full_svc()])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "mega.tf.json").read_text())
+        res = tf["resource"]
+        assert "aws_security_group" in res
+        assert "aws_db_instance" in res
+        assert "aws_elasticache_cluster" in res
+        assert "aws_ecs_task_definition" in res
+        assert "aws_ecs_service" in res
+        assert "aws_iam_role" in res
+        assert "aws_iam_policy" in res
+        assert "aws_secretsmanager_secret" in res
+        assert "aws_cloudwatch_log_group" in res
+
+    def test_terraform_all_features_security_groups(self, tmpdir):
+        """All-features service has DB SG, cache SG, and service SG."""
+        manifest = Manifest(services=[self._full_svc()])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "mega.tf.json").read_text())
+        sgs = tf["resource"]["aws_security_group"]
+        assert "mega" in sgs
+        assert "mega_db" in sgs
+        assert "mega_cache" in sgs
+
+    def test_terraform_external_gets_443_ingress(self, tmpdir):
+        """External all-features service gets 443 ALB ingress."""
+        manifest = Manifest(services=[self._full_svc()])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "mega.tf.json").read_text())
+        sg = tf["resource"]["aws_security_group"]["mega"]
+        ports = [r["from_port"] for r in sg["ingress"]]
+        assert 443 in ports
+
+    def test_kubernetes_all_features(self, tmpdir):
+        """Service with all features generates valid K8s manifests."""
+        manifest = Manifest(services=[self._full_svc()])
+        k8s_files = generate_kubernetes(manifest, tmpdir)
+        assert len(k8s_files) > 0
+        # Check prod manifest exists
+        path = Path(tmpdir) / "kubernetes" / "prod" / "mega.yaml"
+        assert path.exists()
+        content = path.read_text()
+        assert "Deployment" in content
+        assert "Service" in content
+        assert "NetworkPolicy" in content
+        assert "HorizontalPodAutoscaler" in content
+
+    def test_no_drift_all_features(self, tmpdir):
+        """Generate → drift for all-features service shows no drift."""
+        manifest = Manifest(services=[self._full_svc()])
+        generate_terraform(manifest, tmpdir)
+        generate_kubernetes(manifest, tmpdir)
+        report = detect_drift(manifest, tmpdir)
+        assert len(report["forward"]) == 0
+        assert len(report["reverse"]) == 0
+
+    def test_cost_all_features(self):
+        """Cost estimation for all-features service includes all components."""
+        manifest = Manifest(services=[self._full_svc()])
+        costs = estimate_costs(manifest)
+        prod_cost = costs["prod"]["mega"]
+        # Should include: 4 replicas * t3.micro + db + cache + 2 secrets
+        assert prod_cost > 0
+        # 4*7.49 + 12.25 + 11.52 + 2*0.40 = 54.53
+        assert abs(prod_cost - 54.53) < 0.01
+
+
+# ---- Test coverage gaps: Multi-region drift ----
+
+
+class TestMultiRegionDrift:
+    """Tests for multi-region drift detection."""
+
+    def test_multi_region_no_drift(self, tmpdir):
+        """Multi-region generate → drift shows no drift."""
+        manifest = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_terraform(manifest, tmpdir)
+        generate_kubernetes(manifest, tmpdir)
+        report = detect_drift(manifest, tmpdir)
+        assert len(report["forward"]) == 0
+        assert len(report["reverse"]) == 0
+
+    def test_multi_region_orphan_detected(self, tmpdir):
+        """Multi-region drift detects orphaned service files."""
+        # Generate with 2 services
+        m1 = Manifest(
+            services=[_svc("api"), _svc("auth")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        generate_terraform(m1, tmpdir)
+        generate_kubernetes(m1, tmpdir)
+        # Check drift with only 1 service
+        m2 = Manifest(
+            services=[_svc("api")],
+            regions=["us-east-1", "eu-west-1"],
+        )
+        report = detect_drift(m2, tmpdir)
+        orphans = [r for r in report["reverse"] if r["service"] == "auth"]
+        assert len(orphans) > 0
+
+
+# ---- Test coverage gaps: CLI --state with state files ----
+
+
+class TestCLIStateDrift:
+    """Tests for CLI --state drift detection with actual state files."""
+
+    def test_state_drift_no_state_file(self, tmpdir):
+        """State drift with no state file reports all as needs apply."""
+        manifest = Manifest(services=[_svc("api")])
+        generate_terraform(manifest, tmpdir)
+        from infra_gen.state import detect_state_drift
+
+        report = detect_state_drift(tmpdir, "prod")
+        assert len(report["missing_in_state"]) > 0
+        assert len(report["missing_in_manifest"]) == 0
+
+    def test_state_drift_with_matching_state(self, tmpdir):
+        """State drift with matching state reports no drift."""
+        manifest = Manifest(services=[_svc("api")])
+        generate_terraform(manifest, tmpdir)
+        env_dir = Path(tmpdir) / "terraform" / "prod"
+        # Collect all resource addresses from generated files
+        resources = []
+        for tf_file in sorted(env_dir.glob("*.tf.json")):
+            if tf_file.name in (
+                "backend.tf.json",
+                "provider.tf.json",
+                "variables.tf.json",
+            ):
+                continue
+            data = json.loads(tf_file.read_text())
+            for res_type, names in data.get("resource", {}).items():
+                for name in names:
+                    resources.append({"type": res_type, "name": name, "instances": []})
+        # Write matching state
+        state = {"version": 4, "resources": resources}
+        (env_dir / "terraform.tfstate").write_text(json.dumps(state))
+        from infra_gen.state import detect_state_drift
+
+        report = detect_state_drift(tmpdir, "prod")
+        assert len(report["missing_in_state"]) == 0
+        assert len(report["missing_in_manifest"]) == 0
+
+    def test_state_drift_orphaned_resource(self, tmpdir):
+        """State drift detects orphaned resources in state."""
+        manifest = Manifest(services=[_svc("api")])
+        generate_terraform(manifest, tmpdir)
+        env_dir = Path(tmpdir) / "terraform" / "prod"
+        # State with an extra resource not in manifest
+        state = {
+            "version": 4,
+            "resources": [{"type": "aws_rds_instance", "name": "old_db", "instances": []}],
+        }
+        (env_dir / "terraform.tfstate").write_text(json.dumps(state))
+        from infra_gen.state import detect_state_drift
+
+        report = detect_state_drift(tmpdir, "prod")
+        orphans = report["missing_in_manifest"]
+        assert any("old_db" in o["address"] for o in orphans)
+
+
+# ---- Test coverage gaps: Dependency chain with features ----
+
+
+class TestDependencyChainWithFeatures:
+    """Tests for complex dependency chains with mixed features."""
+
+    def test_three_service_chain(self, tmpdir):
+        """A→B→C chain generates correct security group rules."""
+        svc_a = _svc("frontend", deps=["backend"], exposure="external")
+        svc_b = _svc("backend", deps=["database-svc"])
+        svc_c = _svc("database-svc", db="postgres")
+        manifest = Manifest(services=[svc_a, svc_b, svc_c])
+        generate_terraform(manifest, tmpdir)
+
+        # Frontend (external) should have 443 ingress
+        fe_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "frontend.tf.json").read_text())
+        fe_sg = fe_tf["resource"]["aws_security_group"]["frontend"]
+        fe_ports = [r["from_port"] for r in fe_sg["ingress"]]
+        assert 443 in fe_ports
+
+        # Backend should have ingress from frontend on backend's port
+        be_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "backend.tf.json").read_text())
+        be_sg = be_tf["resource"]["aws_security_group"]["backend"]
+        be_ingress_descs = [r["description"] for r in be_sg["ingress"]]
+        assert any("frontend" in d for d in be_ingress_descs)
+
+        # database-svc should have ingress from backend
+        db_tf = json.loads(
+            (Path(tmpdir) / "terraform" / "prod" / "database-svc.tf.json").read_text()
+        )
+        db_sg = db_tf["resource"]["aws_security_group"]["database_svc"]
+        db_ingress_descs = [r["description"] for r in db_sg["ingress"]]
+        assert any("backend" in d for d in db_ingress_descs)
+
+    def test_external_with_dependency_has_both_rules(self, tmpdir):
+        """External service with deps has 443 ingress AND dep-based egress."""
+        svc_ext = _svc("gateway", deps=["api"], exposure="external")
+        svc_api = _svc("api")
+        manifest = Manifest(services=[svc_ext, svc_api])
+        generate_terraform(manifest, tmpdir)
+        gw_tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "gateway.tf.json").read_text())
+        gw_sg = gw_tf["resource"]["aws_security_group"]["gateway"]
+        # Should have 443 ingress
+        ingress_ports = [r["from_port"] for r in gw_sg["ingress"]]
+        assert 443 in ingress_ports
+        # Should have egress to api
+        egress_descs = [r["description"] for r in gw_sg["egress"]]
+        assert any("api" in d for d in egress_descs)
+
+
+# ---- Test coverage gaps: Fargate CPU boundary values ----
+
+
+class TestFargateCPUBoundaries:
+    """Tests for Fargate CPU mapping at boundary values."""
+
+    def test_1m_maps_to_256(self, tmpdir):
+        """1m CPU maps to smallest Fargate value 256."""
+        svc = Service(
+            name="tiny",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="1m"),
+                "staging": EnvOverride(replicas=1, cpu="1m"),
+                "prod": EnvOverride(replicas=1, cpu="1m"),
+            },
+        )
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "tiny.tf.json").read_text())
+        td = tf["resource"]["aws_ecs_task_definition"]["tiny"]
+        assert td["cpu"] == "256"
+
+    def test_256m_maps_to_256(self, tmpdir):
+        """256m CPU maps exactly to 256."""
+        svc = Service(
+            name="exact",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="256m"),
+                "staging": EnvOverride(replicas=1, cpu="256m"),
+                "prod": EnvOverride(replicas=1, cpu="256m"),
+            },
+        )
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "exact.tf.json").read_text())
+        td = tf["resource"]["aws_ecs_task_definition"]["exact"]
+        assert td["cpu"] == "256"
+
+    def test_257m_maps_to_512(self, tmpdir):
+        """257m CPU rounds up to 512."""
+        svc = Service(
+            name="mid",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="257m"),
+                "staging": EnvOverride(replicas=1, cpu="257m"),
+                "prod": EnvOverride(replicas=1, cpu="257m"),
+            },
+        )
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "mid.tf.json").read_text())
+        td = tf["resource"]["aws_ecs_task_definition"]["mid"]
+        assert td["cpu"] == "512"
+
+    def test_4096m_maps_to_4096(self, tmpdir):
+        """4096m CPU maps to max valid 4096."""
+        svc = Service(
+            name="big",
+            port=8080,
+            dependencies=[],
+            db_type="none",
+            cache="none",
+            exposure="internal",
+            env_overrides={
+                "dev": EnvOverride(replicas=1, cpu="4096m"),
+                "staging": EnvOverride(replicas=1, cpu="4096m"),
+                "prod": EnvOverride(replicas=1, cpu="4096m"),
+            },
+        )
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "big.tf.json").read_text())
+        td = tf["resource"]["aws_ecs_task_definition"]["big"]
+        assert td["cpu"] == "4096"
+
+
+# ---- Test coverage gaps: Kubernetes specifics ----
+
+
+class TestKubernetesNetworkPolicyDetails:
+    """Tests for Kubernetes NetworkPolicy specific rules."""
+
+    def test_internal_no_deps_dns_only_egress(self, tmpdir):
+        """Internal service with no deps has only DNS egress."""
+        svc = _svc("isolated")
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "isolated.yaml"
+        content = path.read_text()
+        docs = list(yaml.safe_load_all(content))
+        np = next(d for d in docs if d["kind"] == "NetworkPolicy")
+        egress = np["spec"]["egress"]
+        # Should have DNS egress with empty selector (allow any dest)
+        dns_rules = [r for r in egress if any(p.get("port") == 53 for p in r.get("ports", []))]
+        assert len(dns_rules) == 1
+        assert dns_rules[0]["to"] == [{}]
+
+    def test_policy_types_include_both(self, tmpdir):
+        """NetworkPolicy policyTypes includes both Ingress and Egress."""
+        svc = _svc("api")
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "api.yaml"
+        content = path.read_text()
+        docs = list(yaml.safe_load_all(content))
+        np = next(d for d in docs if d["kind"] == "NetworkPolicy")
+        assert "Ingress" in np["spec"]["policyTypes"]
+        assert "Egress" in np["spec"]["policyTypes"]
+
+
+class TestKubernetesHPADetails:
+    """Tests for HPA specific configuration."""
+
+    def test_hpa_max_replicas_calculation(self, tmpdir):
+        """HPA maxReplicas is max(replicas * 3, 3)."""
+        svc = _svc("api", prod_r=10)
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "api.yaml"
+        content = path.read_text()
+        docs = list(yaml.safe_load_all(content))
+        hpa = next(d for d in docs if d["kind"] == "HorizontalPodAutoscaler")
+        assert hpa["spec"]["maxReplicas"] == 30  # 10 * 3
+
+    def test_hpa_min_replicas_single(self, tmpdir):
+        """HPA minReplicas for single replica service."""
+        svc = _svc("api", dev_r=1, stg_r=1, prod_r=1)
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "api.yaml"
+        content = path.read_text()
+        docs = list(yaml.safe_load_all(content))
+        hpa = next(d for d in docs if d["kind"] == "HorizontalPodAutoscaler")
+        assert hpa["spec"]["minReplicas"] == 1
+        assert hpa["spec"]["maxReplicas"] == 3  # max(1*3, 3)

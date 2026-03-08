@@ -64,10 +64,21 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
     errors: list[ValidationError] = []
     svc_map = manifest.service_map()
     required_envs = ["dev", "staging", "prod"]
-    cpu_regex = re.compile(r"^[0-9]+m$")
+    cpu_regex = re.compile(r"^[1-9][0-9]*m$")
     secret_regex = re.compile(r"^[A-Z][A-Z0-9_]*$")
     name_regex = re.compile(r"^[a-z][a-z0-9-]*$")
     region_regex = re.compile(r"^[a-z]{2}(-[a-z]+-\d+)$")
+
+    valid_db_types = {"postgres", "mysql", "none"}
+    valid_caches = {"redis", "memcached", "none"}
+    valid_exposures = {"internal", "external"}
+
+    # Duplicate service names
+    seen_names: list[str] = [s.name for s in manifest.services]
+    if len(seen_names) != len(set(seen_names)):
+        dupes = {n for n in seen_names if seen_names.count(n) > 1}
+        for d in sorted(dupes):
+            errors.append(ValidationError(f"Duplicate service name: '{d}'"))
 
     # Validate regions
     if not manifest.regions:
@@ -89,6 +100,41 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
                 ValidationError(
                     f"Service '{svc.name}': invalid name "
                     f"(must match ^[a-z][a-z0-9-]*$ for valid Terraform identifiers)"
+                )
+            )
+
+        # Port validation
+        if not isinstance(svc.port, int) or isinstance(svc.port, bool):
+            errors.append(ValidationError(f"Service '{svc.name}': port must be an integer"))
+        elif not (1 <= svc.port <= 65535):
+            errors.append(
+                ValidationError(f"Service '{svc.name}': port must be 1-65535, got {svc.port}")
+            )
+
+        # db_type validation
+        if svc.db_type not in valid_db_types:
+            errors.append(
+                ValidationError(
+                    f"Service '{svc.name}': invalid db_type '{svc.db_type}' "
+                    f"(must be one of: {', '.join(sorted(valid_db_types))})"
+                )
+            )
+
+        # cache validation
+        if svc.cache not in valid_caches:
+            errors.append(
+                ValidationError(
+                    f"Service '{svc.name}': invalid cache '{svc.cache}' "
+                    f"(must be one of: {', '.join(sorted(valid_caches))})"
+                )
+            )
+
+        # exposure validation
+        if svc.exposure not in valid_exposures:
+            errors.append(
+                ValidationError(
+                    f"Service '{svc.name}': invalid exposure '{svc.exposure}' "
+                    f"(must be one of: {', '.join(sorted(valid_exposures))})"
                 )
             )
 
