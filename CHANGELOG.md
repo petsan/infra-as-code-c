@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-03-07
+
+### Added
+- Infrastructure prerequisite warnings: validator now emits info-level
+  reminders when services require a `db_subnet_group_name`,
+  `elasticache_subnet_group_name`, or an ALB for external exposure
+- 14 new tests covering prerequisite warnings, `assign_public_ip`
+  correctness, and Kubernetes/Terraform secrets-with-database interactions
+  (287 total)
+
 ## [0.2.0] - 2026-03-07
 
 This release consolidates the 0.1.x series into a production-hardened baseline.

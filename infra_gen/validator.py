@@ -227,6 +227,37 @@ def validate_manifest(manifest: Manifest) -> list[ValidationError]:
                     )
                 )
 
+    # Infrastructure prerequisite warnings
+    has_db = any(svc.has_db for svc in manifest.services)
+    has_cache = any(svc.has_cache for svc in manifest.services)
+    has_external = any(svc.exposure == "external" for svc in manifest.services)
+
+    if has_db:
+        errors.append(
+            ValidationError(
+                "One or more services use a database; "
+                "ensure 'db_subnet_group_name' variable is set in your Terraform workspace",
+                severity="info",
+            )
+        )
+    if has_cache:
+        errors.append(
+            ValidationError(
+                "One or more services use a cache; ensure "
+                "'elasticache_subnet_group_name' variable is set in your Terraform workspace",
+                severity="info",
+            )
+        )
+    if has_external:
+        errors.append(
+            ValidationError(
+                "External services set assign_public_ip=true and expect an ALB "
+                "on port 443; ensure an ALB is provisioned in a public subnet "
+                "and targets the ECS service",
+                severity="info",
+            )
+        )
+
     # CPU cap warning: millicore values > 4096 silently cap at Fargate max
     for svc in manifest.services:
         for env_name, ov in svc.env_overrides.items():

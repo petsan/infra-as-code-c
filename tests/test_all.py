@@ -3218,3 +3218,145 @@ class TestIterativeDFS:
         cycles = find_all_cycles(manifest)
         cycle_sets = [set(c) for c in cycles]
         assert any({"c0", "c1", "c2", "c3", "c4"} == cs for cs in cycle_sets)
+
+
+# ---- Infrastructure prerequisite warnings ----
+
+
+class TestInfraPrerequisiteWarnings:
+    def test_db_subnet_group_warning(self):
+        """Services with databases trigger a db_subnet_group_name reminder."""
+        svc = _svc("web", db="postgres")
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info"]
+        assert any("db_subnet_group_name" in e.message for e in info)
+
+    def test_cache_subnet_group_warning(self):
+        """Services with caches trigger an elasticache_subnet_group_name reminder."""
+        svc = _svc("web", cache="redis")
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info"]
+        assert any("elasticache_subnet_group_name" in e.message for e in info)
+
+    def test_external_alb_warning(self):
+        """External services trigger an ALB prerequisite reminder."""
+        svc = _svc("web", exposure="external")
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info"]
+        assert any("ALB" in e.message for e in info)
+
+    def test_no_db_no_db_warning(self):
+        """Services without databases don't trigger db warning."""
+        svc = _svc("web")
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info"]
+        assert not any("db_subnet_group_name" in e.message for e in info)
+
+    def test_no_cache_no_cache_warning(self):
+        """Services without caches don't trigger cache warning."""
+        svc = _svc("web")
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info"]
+        assert not any("elasticache_subnet_group_name" in e.message for e in info)
+
+    def test_no_external_no_alb_warning(self):
+        """Internal-only services don't trigger ALB warning."""
+        svc = _svc("web")
+        errors = validate_manifest(Manifest(services=[svc]))
+        info = [e for e in errors if e.severity == "info"]
+        assert not any("ALB" in e.message for e in info)
+
+    def test_warnings_are_info_not_error(self):
+        """Prerequisite warnings don't block generation."""
+        svc = _svc("web", db="postgres", cache="redis", exposure="external")
+        errors = validate_manifest(Manifest(services=[svc]))
+        real_errors = [e for e in errors if e.severity == "error"]
+        assert len(real_errors) == 0
+
+
+# ---- Test gap: assign_public_ip correctness ----
+
+
+class TestECSAssignPublicIP:
+    def test_external_assign_public_ip_true(self, tmpdir):
+        """External services set assign_public_ip=true."""
+        manifest = Manifest(services=[_svc("web", exposure="external")])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        ecs = tf["resource"]["aws_ecs_service"]["web"]
+        assert ecs["network_configuration"]["assign_public_ip"] is True
+
+    def test_internal_assign_public_ip_false(self, tmpdir):
+        """Internal services set assign_public_ip=false."""
+        manifest = Manifest(services=[_svc("web")])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        ecs = tf["resource"]["aws_ecs_service"]["web"]
+        assert ecs["network_configuration"]["assign_public_ip"] is False
+
+
+# ---- Test gap: K8s secrets + database secrets interaction ----
+
+
+class TestSecretsAndDBInteraction:
+    def test_k8s_secrets_with_db_service(self, tmpdir):
+        """Service with both declared secrets and a database generates correctly."""
+        svc = _svc("web", db="postgres")
+        svc.secrets = ["API_KEY", "JWT_SECRET"]
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        # Should have 5 docs: Deployment, Service, NetworkPolicy, HPA, Secret
+        assert len(docs) == 5
+        secret = docs[4]
+        assert secret["kind"] == "Secret"
+        # Only user-declared secrets, not the auto-generated DB one
+        assert set(secret["data"].keys()) == {"API_KEY", "JWT_SECRET"}
+
+    def test_tf_secrets_with_db_service(self, tmpdir):
+        """Terraform generates both user secrets and auto-generated DB secret."""
+        svc = _svc("web", db="postgres")
+        svc.secrets = ["API_KEY"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        sm = tf["resource"]["aws_secretsmanager_secret"]
+        # Should have user secret + auto-generated DB password
+        assert "web_api_key" in sm
+        assert "web_db_password" in sm
+
+    def test_k8s_deployment_envfrom_with_db(self, tmpdir):
+        """Deployment envFrom references user secrets, not DB secret."""
+        svc = _svc("web", db="postgres")
+        svc.secrets = ["API_KEY"]
+        manifest = Manifest(services=[svc])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        container = docs[0]["spec"]["template"]["spec"]["containers"][0]
+        assert "envFrom" in container
+        assert container["envFrom"][0]["secretRef"]["name"] == "web-secrets"
+
+    def test_tf_iam_policy_only_covers_user_secrets(self, tmpdir):
+        """IAM secrets policy covers only user-declared secrets, not DB password."""
+        svc = _svc("web", db="postgres")
+        svc.secrets = ["API_KEY"]
+        manifest = Manifest(services=[svc])
+        generate_terraform(manifest, tmpdir)
+        tf = json.loads((Path(tmpdir) / "terraform" / "prod" / "web.tf.json").read_text())
+        policy = tf["resource"]["aws_iam_policy"]["web_secrets"]
+        stmt = json.loads(policy["policy"])["Statement"][0]
+        # Only the user secret ARN, not the DB password ARN
+        assert len(stmt["Resource"]) == 1
+        assert "web_api_key" in stmt["Resource"][0]
+
+    def test_db_service_no_user_secrets_no_k8s_secret(self, tmpdir):
+        """Service with DB but no user secrets doesn't get a K8s Secret resource."""
+        manifest = Manifest(services=[_svc("web", db="postgres")])
+        generate_kubernetes(manifest, tmpdir)
+        path = Path(tmpdir) / "kubernetes" / "prod" / "web.yaml"
+        docs = list(yaml.safe_load_all(path.read_text()))
+        assert len(docs) == 4  # Deployment, Service, NetworkPolicy, HPA
+        kinds = [d["kind"] for d in docs]
+        assert "Secret" not in kinds
